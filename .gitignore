@@ -1,0 +1,11 @@
+data/*
+*.pt
+*.pyc
+gurobi_read.py
+simplex/*
+*.mps
+*.pkl
+*.yaml
+312_train.log
+result_cache/*
+nohup.out
