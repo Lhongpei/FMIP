@@ -273,31 +273,6 @@ class GMIPModel(COMetaModel):
             return next_Ivars, next_Cvars
         else:
             return next_state_probs, next_Cvars
-        
-    def multimodal_guided_denoise_step(self, single_graph: GraphMILP, t_start, t_end):
-        Ixt = single_graph.extract_Ivars_label().long()
-        with torch.enable_grad():
-            Ixt_with_grad = Ixt.clone().detach().requires_grad_(True).float()
-            single_graph['Ivars'].x = torch.cat([single_graph['Ivars'].x[:, :-1], Ixt_with_grad.view(-1,1)], dim=1)
-            Ixt_1_pred, Cxt_1_pred = self.forward(single_graph, t_start)
-            Ixt_1_pred = torch.nn.functional.softmax(Ixt_1_pred, dim=-1)
-            indices = torch.arange(Ixt_1_pred.shape[1], device=Ixt_1_pred.device)
-            E_Ixt_1_pred = torch.torch.sum(Ixt_1_pred * indices, dim=1)
-            target_value = self.Ivars_batch_target(single_graph, E_Ixt_1_pred, Cxt_1_pred)
-            grad = torch.autograd.grad(target_value.sum(), Ixt_with_grad)[0]
-            grad = rescale_grad(grad, clip_scale=1.0)
-            
-        xt_one_hot = torch.nn.functional.one_hot(Ixt, num_classes=self.max_integer_num).bool()
-        xt_grad = torch.zeros_like(xt_one_hot, dtype=torch.float32)
-        xt_grad[xt_one_hot] = grad
-        non_mask = torch.logical_not(xt_one_hot)
-        xt_grad[non_mask] = -grad.expand_as(xt_grad)[non_mask] / (self.max_integer_num - 1)
-        
-        p_phi = torch.exp(-xt_grad)
-        p_theta = self.DFM.next_state_probs(Ixt_1_pred, Ixt, t_start, t_end)
-        p = p_phi * p_theta
-        posterior = p / p.sum(dim=-1, keepdim=True)
-        next_Ivars = torch.multinomial(posterior, 1).squeeze(-1)
 
     def training_step(self, batch, batch_idx):
         return self.multimodule_training_step(batch, batch_idx) if self.only_discrete == False \
@@ -333,24 +308,24 @@ class GMIPModel(COMetaModel):
             }
             
             try:
-                # ROC AUC (对类别分布不敏感)
+                # ROC AUC 
                 metrics['roc_auc'] = roc_auc_score(true_np, pos_probs)
                 
-                # PR AUC (对正样本敏感)
+                # PR AUC 
                 metrics['pr_auc'] = average_precision_score(true_np, pos_probs)
                 
-                # 动态选择最佳阈值（基于F1最大化）
-                if len(np.unique(true_np)) >= 2:  # 确保正负类都存在
+
+                if len(np.unique(true_np)) >= 2:  
                     precision, recall, thresholds = precision_recall_curve(true_np, pos_probs)
                     f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
-                    best_idx = np.nanargmax(f1_scores)  # 忽略NaN
+                    best_idx = np.nanargmax(f1_scores) 
                     
                     metrics['f1'] = f1_scores[best_idx]
                     metrics['precision'] = precision[best_idx]
                     metrics['recall'] = recall[best_idx]
                     
             except ValueError as e:
-                print(f"Metrics calculation failed: {e}")  # 极端情况下可能报错
+                print(f"Metrics calculation failed: {e}")  
             
         else:
             metrics = {'roc_auc': -1, 'pr_auc': -1, 'f1': -1, 'precision': -1, 'recall': -1}
@@ -590,168 +565,3 @@ class GMIPModel(COMetaModel):
                     graph_data.input_Cvars_label_(pred_Cvars)
 
         return pred_Ivars, pred_Cvars
-
-    @torch.no_grad()
-    def tree_search_inference_branch(self, single_graph:GraphMILP, t_start, t_end, m_path, Ivars_indice, Cvars_indice, FMIPool):
-        # Initialization
-      
-        self.temperature =  10
-        Ixt = single_graph.extract_Ivars_label().long()
-        
-        only_discrete = self.only_discrete     
-        if not only_discrete:
-            Cxt = single_graph.extract_Cvars_label()   
-        # -----------------Discrete Guidance-----------------
-        # (1) No Requirement for gradient
-        Ivars_pred, Cvars_pred = self.forward(single_graph, t_start)
-        Ivars_pred = torch.nn.functional.softmax(Ivars_pred, dim=-1)
-        Ivars_pred_list = torch.multinomial(Ivars_pred, self.R, replacement=True).T
-        Ivars_list_numpy = Ivars_pred_list.cpu().numpy()
-        sampled_Ivars = [Ivars_list_numpy[k] for k in range(self.R)]
-        args_list = []
-        for k in range(self.R):
-            args_list.append((
-                m_path,
-                Ivars_indice,
-                Cvars_indice,
-                Cvars_pred.cpu().numpy() if Cvars_pred is not None else [],
-                sampled_Ivars[k],
-                -1,
-                -1,
-                True
-            ))
-        with Pool(processes=self.R) as pool:
-            results = pool.map(optimize_model_cost_sample_parallel, args_list)
-        target_val = np.array([result[0] for result in results])
-        
-        for val in target_val:
-            insert_pos = bisect.bisect_right(FMIPool['Obj'], val)
-            FMIPool['Obj'].insert(insert_pos, val)
-            FMIPool['Sol'].insert(insert_pos, None)
-            if len(FMIPool['Obj']) > self.solution_pool_size:
-                FMIPool['Obj'].pop()
-                FMIPool['Sol'].pop()
-        
-        
-        modify_Ivars_feasible = np.array([result[1]['Ivars'] for result in results])
-        feasible_Ivars_torch = torch.tensor(modify_Ivars_feasible, device=self.device)
-        target_value = torch.tensor(target_val, device=self.device)
-        normed_target_value = (target_value - target_value.mean()) / (1e-6 + target_value.std())
-        if self.args.sense == 'min':
-            energy = torch.softmax(-normed_target_value/self.temperature, dim=0)
-        elif self.args.sense == 'max':
-            energy = torch.softmax(normed_target_value/self.temperature, dim=0)
-        else:
-            raise ValueError("Sense should be either 'min' or 'max'")
-        rate_m_list = self.DFM.rate_matrix(feasible_Ivars_torch.long(), Ixt, t_start, t_end)
-        
-        #TODO: check the if the following code is correct
-        weighted_rate_m_dt = torch.sum(rate_m_list * energy[:, None, None], dim=0) * (t_end - t_start)
-        next_state_probs = torch.scatter(weighted_rate_m_dt, -1, Ixt[:, None], 0.0)
-        next_state_probs = torch.scatter(next_state_probs, -1, Ixt[:, None], 1.0 - torch.sum(next_state_probs, dim=-1, keepdim=True)).clamp(min=0.0, max=1.0)
-        next_Ivars = torch.multinomial(next_state_probs, 1).reshape(-1)
-
-        if t_end < 1.0:
-            return next_Ivars, Cvars_pred
-        else:
-            return next_state_probs, Cvars_pred
-
-    def inference_FMIPump(self, batch:GraphMILP, name, solution_pool_size):
-            with torch.no_grad():
-                batch.only_discrete = self.only_discrete
-                obj_list = []
-                self.solution_pool_size = solution_pool_size
-                solution_pool = [None for _ in range(solution_pool_size)]
-                FMIPool = {
-                    'Obj': obj_list,
-                    'Sol': solution_pool,
-                }
-                Ivars_solution = batch.extract_Ivars_label()
-                if not self.only_discrete:
-                    Cvars_solution = batch.extract_Cvars_label()
-                    shape_Cvars = Cvars_solution.shape
-                shape_Ivars = Ivars_solution.shape
-                batch.input_Ivars_label_(self.DFM.x_0_sample(shape_Ivars))
-                if not self.only_discrete:
-                    batch.input_Cvars_label_(self.CFM.x_0_sample(shape_Cvars))
-                
-                Ivars_indice, Cvars_indice = _get_variable_info(name)
-                pred_Ivars, pred_Cvars = self.FMIPump_inference_core(batch, name, Ivars_indice, Cvars_indice, FMIPool)
-                return {
-                    'Ivars': pred_Ivars.cpu().numpy(),
-                    'Cvars': pred_Cvars.cpu().numpy() if not self.only_discrete else None,
-                }
-    @torch.no_grad()
-    def FMIPump_inference_core(self, graph_data:GraphMILP, name, Ivars_indice, Cvars_indice, FMIPool):
-        steps = self.inference_steps
-        # Perform diffusion steps
-        for i in range(steps):
-            t_start, t_end = self.inference_scheduler(i)
-            t_start = torch.tensor([t_start], device=self.device)
-            t_end = torch.tensor([t_end], device=self.device)
-            pred_Ivars, pred_Cvars = self.tree_search_inference_branch(graph_data,  torch.tensor([t_start], device=self.device),  
-                                                                       torch.tensor([t_end], device=self.device), name, Ivars_indice, Cvars_indice, FMIPool)
-            if i != steps - 1:
-                graph_data.input_Ivars_label_(pred_Ivars)
-                if not self.only_discrete:
-                    graph_data.input_Cvars_label_(pred_Cvars)
-
-        return pred_Ivars, pred_Cvars
-def _get_variable_info(path):
-        """Extract variable information from the model"""
-        model = gp.read(path)
-        vars_list = model.getVars()
-        
-        Ivars_indice = [i for i, var in enumerate(vars_list) 
-                        if var.VType in [gp.GRB.INTEGER, gp.GRB.BINARY]]
-        # Ivars_origin_lbub = [(var.LB, var.UB) for var in vars_list
-        #                     if var.VType in [gp.GRB.INTEGER, gp.GRB.BINARY]]
-        Cvars_indice = [i for i, var in enumerate(vars_list)
-                        if var.VType == gp.GRB.CONTINUOUS]
-        
-        return Ivars_indice, Cvars_indice
-         
-def optimize_model_cost_sample_parallel(args):
-        """Function to be called in parallel for each model configuration"""
-        (prob_path, Ivars_indice, Cvars_indice, pred_Cvars, 
-        sampled_Ivars_k, set_threads, timelimit, return_solution) = args
-        
-        
-        # Rebuild model from scratch
-        m = gp.read(prob_path)
-        vars_list = m.getVars()
-        
-        # Apply hints for continuous variables
-        if pred_Cvars is not None:
-            for ind, i in enumerate(Cvars_indice):
-                vars_list[i].VarHintVal = pred_Cvars[ind]
-            
-        # Apply hints for integer variables with sampled values
-        original_obj = [vars_list[i].Obj for i in Ivars_indice]
-        for ind, i in enumerate(Ivars_indice):
-            vars_list[i].Obj = -10000000 if sampled_Ivars_k[ind] == 1 else 10000000
-        
-        m.update()
-        if set_threads != -1:
-            m.setParam('Threads', set_threads)
-        if timelimit != -1:
-            m.setParam('TimeLimit', timelimit)
-        m.setParam('OutputFlag', 0)
-        # m.setParam('OutputFlag', 1)
-        
-        m.optimize()
-        for ind, i in enumerate(Ivars_indice):
-            vars_list[i].Obj = original_obj[ind]
-        m.setParam('MIPGap', 0.9999)
-        m.update()
-        m.optimize()
-        if m.Status == gp.GRB.OPTIMAL:
-            # Return model, objective value, and solution
-            if return_solution:
-                Ivars_optimal = np.array([vars_list[i].X for i in Ivars_indice])
-                Cvars_optimal = np.array([vars_list[i].X for i in Cvars_indice])
-                return m.ObjVal, {'Ivars': Ivars_optimal, 'Cvars': Cvars_optimal}
-            else:
-                return m.ObjVal, None
-        else:
-            return float('inf'), None
