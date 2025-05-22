@@ -9,10 +9,10 @@ import copy
 import time
 import concurrent.futures
 import torch
-from pl_gmip_model import GMIPModel
-from utils.milp_reader import MIPmodel
-from arg import default_args
-from utils.gp_utils import pred_by_model
+from fmip.pl_gmip_model import GMIPModel
+from fmip.utils.milp_reader import MIPmodel
+from fmip.arg import default_args
+from fmip.utils.gp_utils import pred_by_model
 
 time_points_dict = {}
 iter_points_dict = {}

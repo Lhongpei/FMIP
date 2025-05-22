@@ -2,7 +2,6 @@ data/*
 *.pt
 *.pyc
 gurobi_read.py
-simplex/*
 *.mps
 *.pkl
 *.yaml

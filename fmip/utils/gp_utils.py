@@ -2,7 +2,6 @@ import gurobipy as gp
 import torch
 import numpy as np
 from pl_gmip_model import GMIPModel
-from pl_gnn_model import GNNModel
 from utils.milp_reader import MIPmodel
 from dataset import toHeteroData
 from utils.lp_utils import recover_basis_np, transform_to_equalities, recover_basis_logits
@@ -41,8 +40,7 @@ def pred_by_model(mip_model: MIPmodel, model, guidance = False, device = 'cuda',
                                         data['C2cons_edge_index'], data['I2cons_edge_index']).to(device)
     if isinstance(model, GMIPModel):
         result = model.inference(graph, guidance = guidance, batchsize = parallel_size)
-    elif isinstance(model, GNNModel):
-        result = model.inference(graph)
+
 
     return result
 
