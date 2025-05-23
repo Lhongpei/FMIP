@@ -39,7 +39,7 @@ def default_args():
     
     parser.add_argument("--discrete_flow_mode", type=str, default="uniform")
     parser.add_argument("--flow_schedule", type=str, default="linear")
-    parser.add_argument("--inference_steps", type=int, default=12)
+    parser.add_argument("--inference_steps", type=int, default=30)
     parser.add_argument("--inference_schedule", type=str, default="cosine")
     parser.add_argument("--inference_trick", type=str, default="ddim")
     parser.add_argument("--sequential_sampling", type=int, default=3)
