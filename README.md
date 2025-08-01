@@ -1,15 +1,11 @@
 # FMIP: Multimodal Flow Matching for Mixed Integer Linear Programming
-
 ![Employ Multimodal Guided Flow Matching to generate estimated solution distribution of MILP](fmip_asset/frame.png)
 
-This repository is the official implementation proposed in paper: 
-
-
-    FMIP: Multimodal Flow Matching for Mixed Integer Linear Programming
+This repository is the official implementation of the paper  
+[**FMIP: Multimodal Flow Matching for Mixed Integer Linear Programming**](http://arxiv.org/abs/2507.23390).
 
 ## Repo Structure
-
-- `downstream/` contains the implementation of downstream solvers mentioned in our paper.
-- `fmip/` contains the core functions of our proposed method, FMIP.
-- `train_scripts/` contains bash scripts used for training model over different datasets.
-- `checkpoints/` contains the checkpoint files over each datasets.
+- `downstream/` — implementation of downstream solvers mentioned in the paper  
+- `fmip/` — core functions of the proposed FMIP method  
+- `train_scripts/` — Bash scripts for training models on different datasets  
+- `checkpoints/` — model checkpoint files for each dataset (links to be updated)
