@@ -121,23 +121,16 @@ class GMIPModel(COMetaModel):
         sampled_values_x_Ivars = torch.sum(x_Ivars_sample_onehot * torch.arange(self.max_integer_num, device=device), dim=1)
         graph_data['Cvars'].x = torch.cat([graph_data['Cvars'].x[:, :-1], x_Cvars_nn.view(-1,1)], dim=1)
         graph_data['Ivars'].x = torch.cat([graph_data['Ivars'].x[:, :-1], sampled_values_x_Ivars.view(-1,1)], dim=1)
-        # feasibility = cal_feasibility_graph(graph_data, reduction=True)
-        # if self.feasibility_scale is None:
-        #     self.feasibility_scale = feasibility.item()
-        # feasibility = feasibility / (self.feasibility_scale + 1e-6)
-        # x_Ivars_nn, x_Cvars_nn = graph_data.projection(x_Ivars_nn, x_Cvars_nn)
         x_Cvars_nn = graph_data.projection_Cvars(x_Cvars_nn)
         loss_c = F.mse_loss(x_Cvars_nn, Cvars_label.float())
         loss_d = self.discrete_loss(x_Ivars_nn, Ivars_label.long())
-        loss = loss_c * self.c_d_weight  + loss_d  #+ feasibility *5
+        loss = loss_c * self.c_d_weight  + loss_d  
  
         self.log("train/loss_c", loss_c)
         self.log("train/loss_d", loss_d)
-        # self.log("train/feasibility", feasibility)
         self.log("train/loss", loss)
         return loss
     
-    # def sampleNeighbor(self, graph_data:GraphMILP):
         
     
     def pure_discrete_training_step(self, graph_data:GraphMILP, batch_idx):
@@ -157,11 +150,6 @@ class GMIPModel(COMetaModel):
         x_Ivars_sample_onehot = torch.nn.functional.gumbel_softmax(x_Ivars_nn, tau=self.get_tau(), hard=True, dim=-1)
         sampled_values_x_Ivars = torch.sum(x_Ivars_sample_onehot * torch.arange(self.max_integer_num, device=device), dim=1)
         graph_data['Ivars'].x = torch.cat([graph_data['Ivars'].x[:, :-1], sampled_values_x_Ivars.view(-1,1)], dim=1)
-        # feasibility = cal_feasibility_graph(graph_data, reduction=True)
-        # if self.feasibility_scale is None:
-        #     self.feasibility_scale = feasibility.item()
-        # feasibility = feasibility / (self.feasibility_scale + 1e-6)
-        # x_Ivars_nn, x_Cvars_nn = graph_data.projection(x_Ivars_nn, x_Cvars_nn)
 
         loss_d = self.discrete_loss(x_Ivars_nn, Ivars_label.long())
         loss = loss_d #+ feasibility *5
@@ -292,13 +280,10 @@ class GMIPModel(COMetaModel):
     
     def cal_metrics(self, graph_data:GraphMILP, pred_Ivars, Ivars_solution):
         ce_loss = F.cross_entropy(pred_Ivars, Ivars_solution.long()).item()
-        # Calculate AUC (only for binary classification)
-        if pred_Ivars.shape[1] == 2:  # binary case
-    # Get probabilities for positive class
+        if pred_Ivars.shape[1] == 2:  
             pos_probs = pred_Ivars[:, 1].detach().cpu().numpy()
             true_np = Ivars_solution.cpu().numpy()
             
-            # Initialize metrics (default to safe values for extreme cases)
             metrics = {
                 'roc_auc': 0.5,
                 'pr_auc': 0.0,
@@ -418,7 +403,6 @@ class GMIPModel(COMetaModel):
     def pure_inference_parallel(self, batch, batch_idx, draw=False, split='test'):
         # start_time = time.time()
         graph_data = duplicate_hetero_data(batch, 32)
-        # node_labels = torch.cat([graph_data['vars'].x[:, -1], graph_data['cons'].x[:, -1]])
         Ivars_solution = graph_data.extract_Ivars_label()
         Cvars_solution = graph_data.extract_Cvars_label()
         shape_Cvars = Cvars_solution.shape
@@ -477,8 +461,6 @@ class GMIPModel(COMetaModel):
             Ivar_ce = F.cross_entropy(pred_Ivars, Ivars_solution.long()).item()
             metrics = {'metric': Cvar_mse + Ivar_ce, 'Cvar_mse': Cvar_mse, 'Ivar_ce': Ivar_ce}
             metrics = metrics | {'feasibility': feasibility[0].item(), 'cost': cost[0].item()}
-            # metrics = metrics | {'cost_time_per_graph': 0}
-            
             for key, value in metrics.items():
                 self.log(f"{split}/{key}", value, on_epoch=True, sync_dist=True, batch_size=batchsize)
                 

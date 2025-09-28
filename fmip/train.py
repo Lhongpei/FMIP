@@ -19,9 +19,9 @@ def arg_parser():
     parser = ArgumentParser(
         description="Train a Pytorch-Lightning diffusion model on a TSP dataset."
     )
-    parser.add_argument("--storage_path", type=str, default="./result_cache")
-    parser.add_argument("--dataset_root", type=str, default="/data/GM4MILP/datasets")
-    parser.add_argument("--dataset_name", type=str, default="load_balancing_tiny")
+    parser.add_argument("--storage_path", type=str, default="SAVE_DIR")
+    parser.add_argument("--dataset_root", type=str, default="DATASET_ROOT")
+    parser.add_argument("--dataset_name", type=str, default="DATASET_NAME")
     parser.add_argument("--dataset_cache", type=str, default="dataset_cache")
 
     parser.add_argument("--training_split", type=str, default="train")
@@ -33,7 +33,7 @@ def arg_parser():
     parser.add_argument(
         "--c_d_weight", type=float, default=1.0, help="Weight for the discrete loss."
     )
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--num_epochs", type=int, default=300)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -54,16 +54,12 @@ def arg_parser():
     parser.add_argument("--flow_schedule", type=str, default="linear")
     parser.add_argument("--inference_steps", type=int, default=50)
     parser.add_argument("--inference_schedule", type=str, default="cosine")
-    parser.add_argument("--inference_trick", type=str, default="ddim")
-    parser.add_argument("--sequential_sampling", type=int, default=3)
-    parser.add_argument("--parallel_sampling", type=int, default=64)
 
     parser.add_argument("--n_layers", type=int, default=12)
     parser.add_argument("--hidden_dim", type=int, default=64)
     parser.add_argument("--sparse_factor", type=int, default=-1)
     parser.add_argument("--aggregation", type=str, default="sum")
     parser.add_argument("--two_opt_iterations", type=int, default=1000)
-    parser.add_argument("--save_numpy_heatmap", action="store_true")
 
     parser.add_argument("--project_name", type=str, default="GMIP")
     parser.add_argument("--wandb_entity", type=str, default=None)

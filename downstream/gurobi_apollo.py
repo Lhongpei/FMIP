@@ -10,7 +10,7 @@ from fmip.utils.gp_utils import pred_by_model
 import copy
 import pickle
 import time
-from fmip.arg import default_args
+from fmip.utils.arg import default_args
 
 time_points = []
 iter_points = []
@@ -18,17 +18,10 @@ obj_values = []
 
 def save_history(model, where):
     if where == GRB.Callback.MIP:
-        # 获取当前运行时间（秒）
         current_time = model.cbGet(GRB.Callback.RUNTIME)
-
-        # Only record every 10 seconds
         if len(time_points) == 0 or current_time - time_points[-1] >= 1:
-            # 获取当前最优解的目标值
             current_obj = model.cbGet(GRB.Callback.MIP_OBJBST)
-            
             current_iteration = model.cbGet(GRB.Callback.MIP_ITRCNT)
-            
-                # 记录时间和 Gap
             time_points.append(current_time)
             obj_values.append(current_obj)
             iter_points.append(current_iteration)

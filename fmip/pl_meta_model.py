@@ -76,26 +76,7 @@ class COMetaModel(pl.LightningModule):
             file_root, saved_path, file_name_list=split_dict["test"], prefix="test",
         )
 
-    # def on_test_epoch_end(self):
-    #       # 将收集的批次结果合并
-    #       unmerged_metrics = {}
-    #       for metrics in self.test_outputs:
-    #           for k, v in metrics.items():
-    #               if k not in unmerged_metrics:
-    #                   unmerged_metrics[k] = []
-    #               unmerged_metrics[k].append(v)
 
-    #       # 计算每个指标的平均值
-    #       merged_metrics = {}
-    #       for k, v in unmerged_metrics.items():
-    #           merged_metrics[k] = float(np.mean(v))
-
-    #       # 记录到日志
-    #       self.logger.log_metrics(merged_metrics, step=self.global_step)
-    #       print(f"Test Metrics: {merged_metrics}")
-
-    #       # 清空 `test_outputs` 以便复用
-    #       self.test_outputs = []
 
     def get_total_num_training_steps(self) -> int:
         """Total training steps inferred from datamodule and devices."""

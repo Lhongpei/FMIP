@@ -11,7 +11,7 @@ import concurrent.futures
 import torch
 from fmip.pl_gmip_model import GMIPModel
 from fmip.utils.milp_reader import MIPmodel
-from fmip.arg import default_args
+from fmip.utils.arg import default_args
 from fmip.utils.gp_utils import pred_by_model
 
 time_points_dict = {}
@@ -20,17 +20,12 @@ obj_values_dict = {}
 
 def save_history(model, where, ind):
     if where == GRB.Callback.MIP:
-        # 获取当前运行时间（秒）
         current_time = model.cbGet(GRB.Callback.RUNTIME)
-
-        # Only record every 10 seconds
         if len(time_points_dict[ind]) == 0 or current_time - time_points_dict[ind][-1] >= 1:
-            # 获取当前最优解的目标值
+
             current_obj = model.cbGet(GRB.Callback.MIP_OBJBST)
-            
             current_iteration = model.cbGet(GRB.Callback.MIP_ITRCNT)
             
-                # 记录时间和 Gap
             time_points_dict[ind].append(current_time)
             obj_values_dict[ind].append(current_obj)
             iter_points_dict[ind].append(current_iteration)
@@ -78,75 +73,7 @@ class NeuralDivingOptimizer:
         
         return vars_list, Ivars_indice, Cvars_indice
     
-    # def apply_threshould_fixed_strategy(self, path, pred_Ivars_prob, pred_Cvars, Ivars_indice, Cvars_indice, threshold=0.8):
-    #     model = gp.read(path)
-    #     vars_list = model.getVars()
-    #     return self._apply_threshould_fixed_strategy(
-    #         model, vars_list, pred_Ivars_prob, pred_Cvars, 
-    #         Ivars_indice, Cvars_indice, threshold
-    #     )
-        
-    # def fallback_strategy(self, path, pred_Ivars, pred_Cvars, Ivars_indice, Cvars_indice):
-    #     model = gp.read(path)
-    #     vars_list = model.getVars()
-    #     return self._fallback_strategy(
-    #         model, vars_list, pred_Ivars, pred_Cvars, Ivars_indice, Cvars_indice
-    #     )
-    
-    # def solve_original_problem(self, path):
-    #     model = gp.read(path)
-    #     return self._solve_original_problem(model)
-    
-    # def _apply_threshould_fixed_strategy(self, model, vars_list, pred_Ivars_prob, pred_Cvars, 
-    #                      Ivars_indice, Cvars_indice, threshold):
-    #     """Apply warm start with given threshold"""
-    #     extreme_row = np.where(np.max(pred_Ivars_prob, axis=1) > threshold)[0]
-    #     pred_Ivars = np.argmax(pred_Ivars_prob, axis=1)
-        
-    #     for i in extreme_row:
-    #         vars_list[i].LB = pred_Ivars[i]
-    #         vars_list[i].UB = pred_Ivars[i]
-            
-    #     for ind, i in enumerate(Cvars_indice):
-    #         vars_list[i].Start = pred_Cvars[ind]
-            
-    #     model.update()
-    #     model.optimize()
-    #     return {
-    #         'status': model.Status,
-    #         'time': model.Runtime,
-    #         'obj': model.ObjVal if model.Status == gp.GRB.OPTIMAL else None
-    #     }
-        
-    # def _fallback_strategy(self, model, vars_list, pred_Ivars, pred_Cvars, Ivars_indice, Cvars_indice):
-    #     """Fallback strategy when initial warm start fails"""
-    #     for ind, i in enumerate(Ivars_indice):
-    #         vars_list[i].Start = pred_Ivars[ind]
-            
-    #     for ind, i in enumerate(Cvars_indice):
-    #         vars_list[i].Start = pred_Cvars[ind]
-            
-    #     model.update()
-    #     model.optimize()
-    #     return {
-    #             'status': model.Status,
-    #             'time': model.Runtime,
-    #             'obj': model.ObjVal if model.Status == gp.GRB.OPTIMAL else None
-    #         }
-    
-    # def _solve_original_problem(self, model):
-    #     """Solve original problem without warm start"""
-    #     if self.set_threads is not None:
-    #         model.setParam('Threads', self.set_threads)
-    #     if self.timelimit is not None:
-    #         model.setParam('Timelimit', self.timelimit)
-    #     model.optimize()
-    #     return {
-    #         'status': model.Status,
-    #         'time': model.Runtime,
-    #         'obj': model.ObjVal if model.Status == gp.GRB.OPTIMAL else None
-    #     }
-    
+
     def apply_sampled_strategy(self, path, pred_Ivars_prob,
                           Ivars_indice, sample_times=10, fixed_ratio=1.):
         """Apply warm start with sampled strategy using parallel solving
@@ -186,8 +113,6 @@ class NeuralDivingOptimizer:
                 fixed_ind_set[i],
                 pred_Ivars[i],
                 i
-                # pred_Cvars,
-                # Cvars_indice
             ))
         
         # Function to process a single sample
@@ -204,10 +129,7 @@ class NeuralDivingOptimizer:
             for i in sample_batch:
                 vars_list[i].LB = pred_Ivars[i]
                 vars_list[i].UB = pred_Ivars[i]
-            
-            # # Set warm start for continuous variables
-            # for ind, i in enumerate(Cvars_indice):
-            #     vars_list[i].Start = pred_Cvars[ind]
+
             
             model.update()
             # model.setParam('OutputFlag', 0)  # Suppress output
@@ -279,13 +201,6 @@ class NeuralDivingOptimizer:
             result['warm_solving_time'] = max_solving_time
             result['warm_obj'] = best_model.ObjVal if best_model is not None else None
             result['warm_iter'] = best_model.IterCount if best_model is not None else None
-        # else:
-        #     best_model, max_solving_time2 = self.apply_sampled_strategy(
-        #         problem_path, pred_Ivars_prob, pred_Cvars,
-        #         Ivars_indice, Cvars_indice, sample_times=10, fixed_ratio=0.5
-        #     )
-        #     result['warm_solving_time'] = max_solving_time + max_solving_time2
-        #     result['warm_obj'] = best_model.ObjVal if best_model is not None else None
         return result
        
     def run_all(self):
@@ -303,21 +218,6 @@ class NeuralDivingOptimizer:
                 
         return pd.DataFrame(self.result_dict).T
 
-    
-    # def run_all_pred_origin(self):
-    #     """Process all prediction files"""
-    #     origin_result_dict = {}
-    #     pred_name_list = os.listdir(self.prediction_dir)
-    #     for pred_name in tqdm(pred_name_list):
-    #         prob_name = pred_name.replace('_pred.pkl', '.mps.gz')
-    #         problem_path = os.path.join(self.problem_root, prob_name)
-    #         try:
-    #             origin_result_dict[prob_name] = self.solve_original_problem(problem_path)
-    #         except Exception as e:
-    #             print(f"Error processing {prob_name}: {str(e)}")
-    #             origin_result_dict[prob_name] = {'error': str(e)}
-                
-    #     return pd.DataFrame(origin_result_dict).T
     
     def save_results(self, output_file='warmstart_result.csv'):
         """Save results to CSV"""

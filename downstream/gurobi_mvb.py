@@ -14,26 +14,19 @@ import gurobipy as gp
 from tqdm import tqdm
 from fmip.pl_gmip_model import GMIPModel
 from fmip.utils.milp_reader import MIPmodel
-from fmip.arg import default_args
+from fmip.utils.arg import default_args
 from fmip.utils.gp_utils import pred_by_model
-
+from gurobipy import GRB
 time_points = []
 iter_points = []
 obj_values = []
 
 def save_history(model, where):
     if where == GRB.Callback.MIP:
-        # 获取当前运行时间（秒）
         current_time = model.cbGet(GRB.Callback.RUNTIME)
-
-        # Only record every 10 seconds
         if len(time_points) == 0 or current_time - time_points[-1] >= 1:
-            # 获取当前最优解的目标值
             current_obj = model.cbGet(GRB.Callback.MIP_OBJBST)
-            
             current_iteration = model.cbGet(GRB.Callback.MIP_ITRCNT)
-            
-                # 记录时间和 Gap
             time_points.append(current_time)
             obj_values.append(current_obj)
             iter_points.append(current_iteration)
@@ -212,11 +205,7 @@ if __name__ == "__main__":
         'load_balance': 'min',
         'setcover': 'min',
     }
-    # for problem_set in os.listdir(root_dir):
-    # for problem_set in ['gisp', 'indset', 'setcover', 'fcmnf', 'cauctions', 'load_balance', 'item_placement']:
     for problem_set in ['item_placement']:
-        # if os.path.exists(f'downstream_result/mvb/{source}_mvb_solve_{problem_set}_{str(param)}.csv'):
-        #     continue
         sense = senses[problem_set]
         policy_root = f'/data/GM4MILP/result_cache/models/{"" if source == "diff" else "gnn_"}{problem_set}/'
         save_folders = np.sort(os.listdir(policy_root))[-1]
