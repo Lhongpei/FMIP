@@ -3,7 +3,6 @@ data/*
 *.pyc
 gurobi_read.py
 *.mps
-*.pkl
 *.yaml
 312_train.log
 result_cache/*
