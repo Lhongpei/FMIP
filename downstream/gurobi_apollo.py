@@ -250,6 +250,9 @@ if __name__ == "__main__":
         'setcover': [
             [0.3, 0.04, 0.2, 2]
         ],
+        'load_balance': [
+            [0.2, 0.2, 0.5, 2]
+        ]
     }
     senses = {
         'cauctions': 'max',

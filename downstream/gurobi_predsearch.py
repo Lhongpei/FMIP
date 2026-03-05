@@ -195,6 +195,9 @@ if __name__ == "__main__":
         'setcover': [
             [0.3, 0.04, 0.2]
         ],
+        'miplib': [
+            [0.2, 0.2, 0.5]
+        ]
     }
     senses = {
         'cauctions': 'max',
