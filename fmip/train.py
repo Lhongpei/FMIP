@@ -13,7 +13,6 @@ from pytorch_lightning.strategies.ddp import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_info
 import time
 from pl_gmip_model import GMIPModel
-from pl_gmip_model import GMIPModel
 
 def arg_parser():
     parser = ArgumentParser(

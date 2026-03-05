@@ -1,6 +1,6 @@
 #!/bin/bash
 
-python train.py \
+python fmip/train.py \
   --storage_path ./result_cache \
   --dataset_root /data/GM4MILP/gnn4co_instances \
   --dataset_name cauctions \
