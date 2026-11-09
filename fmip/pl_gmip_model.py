@@ -2,19 +2,20 @@
 
 import os
 import gurobipy as gp
-from pl_meta_model import COMetaModel
-from dataset import GraphMILP
+from fmip.pl_meta_model import COMetaModel
+from fmip.dataset import GraphMILP, _atomic_write
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pl_meta_model import COMetaModel
-from utils.lp_utils import *
+from torch_geometric.data import Batch
+from fmip.utils.utils import get_file_extension
+from fmip.utils.lp_utils import *
 import pickle
-from models.gnn import MILPGCN
-from utils.milp_utils import *
+from fmip.models.gnn import MILPGCN
+from fmip.utils.milp_utils import *
 import bisect
-from utils.focalloss import FocalLoss
+from fmip.utils.focalloss import FocalLoss
 from torch.multiprocessing import Pool
 import bisect
 from sklearn.metrics import (
@@ -31,11 +32,13 @@ class GMIPModel(COMetaModel):
                param_args=None, load_datasets=True):
 
         super(GMIPModel, self).__init__(param_args=param_args, load_datasets=load_datasets)
-        self.R = 32
-        self.N_iter = 2
+        self.R = getattr(self.args, "num_discrete_sample", 32)
+        self.N_iter = getattr(self.args, "num_continuous_guide_step", 2)
+        if self.R < 1 or self.N_iter < 0:
+            raise ValueError("Guidance needs at least one discrete sample and nonnegative continuous steps")
         self.init_tau = 1
         self.min_tau = 0.1
-        self.model = self.model = MILPGCN(
+        self.model = MILPGCN(
             input_dim_x_Cvars=self.Cvars_dim,
             input_dim_x_Ivars=self.Ivars_dim,
             input_dim_x_cons=self.cons_dim,
@@ -45,17 +48,27 @@ class GMIPModel(COMetaModel):
             learn_norm=True,
             only_discrete=self.only_discrete,
             )
-        self.Ivars_batch_target = target_func(weight_c=0.002, weight_f=1, if_reduction=False, if_only_graph=False, if_Ivars_batch=True, if_Cvars_batch=False)
-        self.Cvars_batch_target = target_func(weight_c=0.002, weight_f=1, if_reduction=True, if_only_graph=False, if_Ivars_batch=False, if_Cvars_batch=False)
+        objective_sign = -1 if getattr(self.args, "sense", "min") == "max" else 1
+        self.Ivars_batch_target = target_func(weight_c=objective_sign * 0.002, weight_f=1, if_reduction=False, if_only_graph=False, if_Ivars_batch=True, if_Cvars_batch=False)
+        self.Cvars_batch_target = target_func(weight_c=objective_sign * 0.002, weight_f=1, if_reduction=True, if_only_graph=False, if_Ivars_batch=False, if_Cvars_batch=False)
         self.target = target_func(weight_c=1, weight_f=1, if_reduction=True, if_only_graph=False, if_Ivars_batch=False, if_Cvars_batch=False)
         self.feasibility_scale = None
-        if self.args.ce_weight is not None:
-            ce_weight = torch.tensor(self.args.ce_weight).float().to(self.device)
+        class_weights = self.args.ce_weight
+        if class_weights is not None:
+            class_weights = list(class_weights)
+            if self.DFM.mode == "mask" and len(class_weights) == self.max_integer_num - 1:
+                class_weights.append(0.0)
+            if len(class_weights) != self.max_integer_num:
+                raise ValueError("ce_weight must provide one weight per real class (and optionally the mask)")
+            if any(weight < 0 or not np.isfinite(weight) for weight in class_weights) or not any(class_weights):
+                raise ValueError("Class weights must be finite, nonnegative, and not all zero")
+            ce_weight = torch.tensor(class_weights).float().to(self.device)
         else:
             ce_weight = None
-        self.discrete_loss = nn.CrossEntropyLoss(weight=ce_weight) if not self.args.use_focal_loss else FocalLoss(gamma=1, alpha=0.5)
+        focal_weights = class_weights if class_weights is not None else [0.5] * self.max_integer_num
+        self.discrete_loss = nn.CrossEntropyLoss(weight=ce_weight) if not self.args.use_focal_loss else FocalLoss(gamma=1, alpha=focal_weights)
         if self.args.use_focal_loss:
-            print('Using Focal Loss with gamma=2 and alpha=0.5')
+            print(f'Using Focal Loss with gamma=1 and alpha={focal_weights}')
             
             
     def forward(self, graph_data:GraphMILP, t):
@@ -78,7 +91,7 @@ class GMIPModel(COMetaModel):
 
     def discrete_training_noise(self, node_labels, point_indicator, t):
         # Sample from diffusion
-        t = torch.from_numpy(t).long().to(self.device)
+        t = torch.as_tensor(t, dtype=torch.float32, device=self.device)
         t = t.repeat_interleave(point_indicator.reshape(-1), dim=0)
         xt = self.DFM.sample(node_labels, t)
         t = t.reshape(-1)
@@ -86,7 +99,7 @@ class GMIPModel(COMetaModel):
         return xt, t
     
     def continuous_training_noise(self, node_labels, point_indicator, t):
-        t = torch.from_numpy(t).long().to(self.device)
+        t = torch.as_tensor(t, dtype=torch.float32, device=self.device)
         # t = torch.cat([t.repeat_interleave(point_indicator_var.reshape(-1).cpu(), dim=0),
         #                t.repeat_interleave(point_indicator_cons.reshape(-1).cpu(), dim=0)])
         t = t.repeat_interleave(point_indicator.reshape(-1), dim=0)
@@ -101,7 +114,7 @@ class GMIPModel(COMetaModel):
         point_indicator_Cvars = graph_data['Cvars'].ptr[1:] - graph_data['Cvars'].ptr[:-1]
         point_indicator_Ivars = graph_data['Ivars'].ptr[1:] - graph_data['Ivars'].ptr[:-1]
 
-        t = np.random.rand(point_indicator_Cvars.shape[0])
+        t = torch.rand(point_indicator_Cvars.shape[0], device=self.device)
         Cvars_label = graph_data.extract_Cvars_label()
         Ivars_label = graph_data.extract_Ivars_label()
         device = Cvars_label.device
@@ -121,9 +134,10 @@ class GMIPModel(COMetaModel):
         sampled_values_x_Ivars = torch.sum(x_Ivars_sample_onehot * torch.arange(self.max_integer_num, device=device), dim=1)
         graph_data['Cvars'].x = torch.cat([graph_data['Cvars'].x[:, :-1], x_Cvars_nn.view(-1,1)], dim=1)
         graph_data['Ivars'].x = torch.cat([graph_data['Ivars'].x[:, :-1], sampled_values_x_Ivars.view(-1,1)], dim=1)
-        x_Cvars_nn = graph_data.projection_Cvars(x_Cvars_nn)
-        loss_c = F.mse_loss(x_Cvars_nn, Cvars_label.float())
-        loss_d = self.discrete_loss(x_Ivars_nn, Ivars_label.long())
+        # Clamping before MSE gives zero gradients for predictions outside the
+        # bounds, preventing the continuous head from learning to recover.
+        loss_c = F.mse_loss(x_Cvars_nn, Cvars_label.float()) if Cvars_label.numel() else x_Cvars_nn.sum()
+        loss_d = self.discrete_training_loss(x_Ivars_nn, Ivars_label.long())
         loss = loss_c * self.c_d_weight  + loss_d  
  
         self.log("train/loss_c", loss_c)
@@ -136,7 +150,7 @@ class GMIPModel(COMetaModel):
     def pure_discrete_training_step(self, graph_data:GraphMILP, batch_idx):
         point_indicator_Ivars = graph_data['Ivars'].ptr[1:] - graph_data['Ivars'].ptr[:-1]
 
-        t = np.random.rand(point_indicator_Ivars.shape[0])
+        t = torch.rand(point_indicator_Ivars.shape[0], device=self.device)
         Ivars_label = graph_data.extract_Ivars_label()
         device = Ivars_label.device
         
@@ -151,7 +165,7 @@ class GMIPModel(COMetaModel):
         sampled_values_x_Ivars = torch.sum(x_Ivars_sample_onehot * torch.arange(self.max_integer_num, device=device), dim=1)
         graph_data['Ivars'].x = torch.cat([graph_data['Ivars'].x[:, :-1], sampled_values_x_Ivars.view(-1,1)], dim=1)
 
-        loss_d = self.discrete_loss(x_Ivars_nn, Ivars_label.long())
+        loss_d = self.discrete_training_loss(x_Ivars_nn, Ivars_label.long())
         loss = loss_d #+ feasibility *5
  
         self.log("train/loss_c", 0)
@@ -160,11 +174,28 @@ class GMIPModel(COMetaModel):
         self.log("train/loss", loss)
         return loss
 
-    def training_step(self, batch, batch_idx):
-        return self.multimodule_training_step(batch, batch_idx)
-        
+    def discrete_training_loss(self, logits, labels):
+        if labels.numel() == 0:
+            return logits.sum()
+        if isinstance(self.discrete_loss, nn.CrossEntropyLoss):
+            weight = self.discrete_loss.weight
+            if weight is not None and weight[labels].sum() == 0:
+                return logits.sum() * 0
+        return self.discrete_loss(logits, labels)
+
     def discrete_denoise(self, x0, xt, t_start, t_end):
         return self.DFM.next_state(x0, xt, t_start, t_end)
+
+    def project_integer_probabilities(self, graph_data, probabilities):
+        # Keep probability arithmetic and flow times precise under CPU/CUDA AMP.
+        # NumPy also cannot represent bfloat16 prediction arrays.
+        if probabilities.dtype in (torch.float16, torch.bfloat16):
+            probabilities = probabilities.float()
+        if self.DFM.mode == "mask":
+            # The reserved mask is a noise state, never a clean prediction.
+            clean = graph_data.projection_Ivars(probabilities[:, :-1])
+            return F.pad(clean, (0, 1))
+        return graph_data.projection_Ivars(probabilities)
         
     def continuous_denoise(self, v, xt, t_start, t_end):
         return self.CFM.denoise(v, xt, t_start, t_end)
@@ -174,6 +205,25 @@ class GMIPModel(COMetaModel):
         graph_data, t_start
         )
         return pred_Ivars_0, pred_Cvars_0
+
+    def _guidance_target(self, target, graph_data, integers, continuous):
+        # CUDA sparse matrix products do not support the FP16 autocast path.
+        # Constraint/objective arithmetic also needs the graph coefficient precision.
+        with torch.autocast(device_type=integers.device.type, enabled=False):
+            dtype = graph_data['Ivars'].x.dtype
+            integers = integers.to(dtype=dtype)
+            continuous = continuous.to(dtype=dtype) if continuous is not None else None
+            sense = getattr(graph_data, "model_sense", None)
+            weight = target.weight_c
+            if sense is not None:
+                sense = torch.as_tensor(sense, device=integers.device).reshape(-1)
+                if sense.numel() != 1:
+                    raise ValueError("Guidance operates on one graph at a time")
+                weight = abs(weight) * sense[0]
+            # Constant offsets cannot affect guidance. Omitting them before
+            # arithmetic preserves small candidate differences in float32.
+            return (weight * target.objective_cal(graph_data, integers, continuous, include_constant=False)
+                    + target.weight_f * target.feasibility_cal(graph_data, integers, continuous))
         
     def mixed_denoise_step(self, batch: GraphMILP, t_start, t_end):
         with torch.no_grad():
@@ -181,10 +231,12 @@ class GMIPModel(COMetaModel):
             x_Ivars_t = batch.extract_Ivars_label().long()
             pred_Ivars_0, pred_Cvars_0 = self.pred_clean_sample(batch, t_start)
             pred_Ivars_0 = torch.nn.functional.softmax(pred_Ivars_0, dim=-1)
-            pred_Ivars_0 = batch.projection_Ivars(pred_Ivars_0)
+            pred_Ivars_0 = self.project_integer_probabilities(batch, pred_Ivars_0)
             pred_Cvars_0 = batch.projection_Cvars(pred_Cvars_0)
             Ivars_t = self.discrete_denoise(pred_Ivars_0, x_Ivars_t, t_start, t_end)
             Cvars_t = self.continuous_denoise(pred_Cvars_0, x_Cvars_t, t_start, t_end)
+            if t_end >= 1.0:
+                Cvars_t = batch.projection_Cvars(Cvars_t)
             return Ivars_t, Cvars_t
         
     def discrete_denoise_step(self, batch: GraphMILP, t_start, t_end):
@@ -192,13 +244,14 @@ class GMIPModel(COMetaModel):
             x_Ivars_t = batch.extract_Ivars_label().long()
             pred_Ivars_0, _ = self.pred_clean_sample(batch, t_start)
             pred_Ivars_0 = torch.nn.functional.softmax(pred_Ivars_0, dim=-1)
-            pred_Ivars_0 = batch.projection_Ivars(pred_Ivars_0)
+            pred_Ivars_0 = self.project_integer_probabilities(batch, pred_Ivars_0)
             Ivars_t = self.discrete_denoise(pred_Ivars_0, x_Ivars_t, t_start, t_end)
             return Ivars_t
     
 
     @torch.no_grad()#TODO Add Batch support
     def multimodal_guided_denoise_step_TFG(self, single_graph: GraphMILP, t_start, t_end):
+        single_graph.only_discrete = self.only_discrete
         self.temperature = 1
         self.step_size = 0.1
         Ixt = single_graph.extract_Ivars_label().long()
@@ -210,33 +263,26 @@ class GMIPModel(COMetaModel):
         # (1) No Requirement for gradient
         Ivars_pred, Cvars_pred = self.forward(single_graph, t_start)
         Ivars_pred = torch.nn.functional.softmax(Ivars_pred, dim=-1)
+        Ivars_pred = self.project_integer_probabilities(single_graph, Ivars_pred)
         Ivars_pred_list = torch.multinomial(Ivars_pred, self.R, replacement=True).T
-        if not only_discrete:
-            Clb = single_graph['Cvars'].x[:, 0]
-            Cub = single_graph['Cvars'].x[:, 1]
-        
-        
-        target_value = self.Ivars_batch_target(single_graph, Ivars_pred_list.float(), Cvars_pred)
-        normed_target_value = (target_value - target_value.mean()) / (1e-6 + target_value.std())
-        if self.args.sense == 'min':
-            energy = torch.softmax(-normed_target_value/self.temperature, dim=0)
-        elif self.args.sense == 'max':
-            energy = torch.softmax(normed_target_value/self.temperature, dim=0)
-        else:
-            raise ValueError("Sense should be either 'min' or 'max'")
+        target_value = self._guidance_target(self.Ivars_batch_target, single_graph, Ivars_pred_list.float(), Cvars_pred)
+        normed_target_value = (target_value - target_value.mean()) / (1e-6 + target_value.std(unbiased=False))
+        # The objective sign is handled by the target; feasibility is always a penalty.
+        energy = torch.softmax(-normed_target_value/self.temperature, dim=0)
         rate_m_list = self.DFM.rate_matrix(Ivars_pred_list.long(), Ixt, t_start, t_end)
         
         #TODO: check the if the following code is correct
         weighted_rate_m_dt = torch.sum(rate_m_list * energy[:, None, None], dim=0) * (t_end - t_start)
         next_state_probs = torch.scatter(weighted_rate_m_dt, -1, Ixt[:, None], 0.0)
         next_state_probs = torch.scatter(next_state_probs, -1, Ixt[:, None], 1.0 - torch.sum(next_state_probs, dim=-1, keepdim=True)).clamp(min=0.0, max=1.0)
+        next_state_probs = next_state_probs / next_state_probs.sum(dim=-1, keepdim=True)
         next_Ivars = torch.multinomial(next_state_probs, 1).reshape(-1)
         
         sample_discrete_idx = torch.multinomial(energy, 1).reshape(-1)
         sample_discrete = Ivars_pred_list[sample_discrete_idx]
 
         
-        if not only_discrete:
+        if not only_discrete and Cxt.numel():
             #-----------------Continuous Guidance-----------------
             single_graph.input_Ivars_label_(Ixt)
             with torch.enable_grad():
@@ -244,16 +290,22 @@ class GMIPModel(COMetaModel):
                     Cxt_copy = Cxt.clone().detach().requires_grad_(True)
                     single_graph['Cvars'].x = torch.cat([single_graph['Cvars'].x[:, :-1], Cxt_copy.view(-1,1)], dim=1)
                     _, Cxt_1 = self.forward(single_graph, t_start)
-                    target_value = self.Cvars_batch_target(single_graph, sample_discrete.squeeze(0).float(), Cxt_1)
-                    grad = torch.autograd.grad(target_value.sum(), Cxt_copy)[0]
+                    target_value = self._guidance_target(self.Cvars_batch_target, single_graph, sample_discrete.squeeze(0).float(), Cxt_1)
+                    # Sparse backward must also run outside Lightning's AMP
+                    # context, not just the target's forward computation.
+                    with torch.autocast(device_type=Cxt_copy.device.type, enabled=False):
+                        grad = torch.autograd.grad(target_value.sum(), Cxt_copy)[0]
                     grad_ = rescale_grad(grad, clip_scale=1.0)
-                    Cxt = torch.clamp(Cxt - self.step_size * grad_, Clb, Cub)
+                    Cxt = single_graph.projection_Cvars(Cxt - self.step_size * grad_)
             
-            single_graph.input_Ivars_label_(sample_discrete)
+            single_graph.input_Ivars_label_(sample_discrete.reshape(-1))
             single_graph.input_Cvars_label_(Cxt)
             Cvars_new_pred = self.forward(single_graph, t_start)[1]
-            v_pred = (Cvars_new_pred - Cxt) / (1 - t_start)
-            next_Cvars = torch.clamp(Cxt + v_pred * (t_end - t_start), Clb, Cub).squeeze()
+            next_Cvars = single_graph.projection_Cvars(
+                self.continuous_denoise(Cvars_new_pred, Cxt, t_start, t_end)
+            ).reshape(-1)
+        elif not only_discrete:
+            next_Cvars = Cxt
         else:
             next_Cvars = None
             
@@ -267,11 +319,16 @@ class GMIPModel(COMetaModel):
             else self.pure_discrete_training_step(batch, batch_idx)
 
     def test_step(self, batch, batch_idx, draw=False, split='test'):
+        if getattr(self.args, "use_guidance", False) and self.args.inference_type != 'parallel':
+            # Guidance needs per-instance objectives and must not couple graphs.
+            metrics = [self.inference_parallel(
+                Batch.from_data_list([graph]), batch_idx, draw=draw, split=split
+            ) for graph in batch.to_data_list()]
+            return {key: float(np.mean([row[key] for row in metrics])) for key in metrics[0]}
         return self.inference_parallel(batch, batch_idx, draw=draw, split=split) if self.args.inference_type =='parallel' \
             else self.inference_batch(batch, batch_idx, draw=draw, split=split)
 
     def validation_step(self, batch:GraphMILP, batch_idx):
-        assert self.device != 'cpu'
         return self.test_step(batch, batch_idx, split='val')
     
     def inference_batch(self, batch:GraphMILP, batch_idx, draw=False, split='test'):
@@ -279,8 +336,10 @@ class GMIPModel(COMetaModel):
             else self.inference_batch_multimodal(batch, batch_idx, draw=draw, split=split)
     
     def cal_metrics(self, graph_data:GraphMILP, pred_Ivars, Ivars_solution):
-        ce_loss = F.cross_entropy(pred_Ivars, Ivars_solution.long()).item()
-        if pred_Ivars.shape[1] == 2:  
+        # Inference returns probabilities; cross_entropy would apply softmax twice.
+        ce_loss = F.nll_loss(pred_Ivars.clamp_min(1e-12).log(), Ivars_solution.long()).item()
+        real_classes = pred_Ivars.shape[1] - int(self.DFM.mode == 'mask')
+        if real_classes == 2:
             pos_probs = pred_Ivars[:, 1].detach().cpu().numpy()
             true_np = Ivars_solution.cpu().numpy()
             
@@ -294,13 +353,14 @@ class GMIPModel(COMetaModel):
             
             try:
                 # ROC AUC 
-                metrics['roc_auc'] = roc_auc_score(true_np, pos_probs)
+                if len(np.unique(true_np)) == 2:
+                    metrics['roc_auc'] = roc_auc_score(true_np, pos_probs)
                 
                 # PR AUC 
-                metrics['pr_auc'] = average_precision_score(true_np, pos_probs)
+                metrics['pr_auc'] = average_precision_score(true_np, pos_probs) if np.any(true_np == 1) else 0.0
                 
 
-                if len(np.unique(true_np)) >= 2:  
+                if np.any(true_np == 1):
                     precision, recall, thresholds = precision_recall_curve(true_np, pos_probs)
                     f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
                     best_idx = np.nanargmax(f1_scores) 
@@ -323,7 +383,7 @@ class GMIPModel(COMetaModel):
         feasibility = cal_feasibility_graph(graph_data, reduction=False).mean()
         metrics = metrics | {'feasibility': feasibility.item(), 'ce_loss': ce_loss}
         pr_auc = metrics['pr_auc']
-        metrics = metrics | {'metric': pr_auc}
+        metrics = metrics | {'metric': pr_auc if real_classes == 2 else -ce_loss}
             
         return metrics
     
@@ -364,10 +424,10 @@ class GMIPModel(COMetaModel):
 
         pred_Ivars, pred_Cvars = self.inference_core(graph_data)
         # predict_labels_mask = predict_labels_mask
-        
+        graph_data.input_Cvars_label_(pred_Cvars)
         
         metrics = self.cal_metrics(graph_data, pred_Ivars, Ivars_solution.long())
-        metrics = metrics | {'Cvar_mse': F.mse_loss(pred_Cvars, Cvars_solution.float()).item()}
+        metrics = metrics | {'Cvar_mse': F.mse_loss(pred_Cvars, Cvars_solution.float()).item() if Cvars_solution.numel() else 0.0}
         batchsize = len(graph_data['Ivars'].ptr[1:])
         # metrics = metrics | {'cost_time_per_graph': 0}
         if self.args.save_predictions:
@@ -380,76 +440,58 @@ class GMIPModel(COMetaModel):
         return metrics
         
     def save_labels(self, Ivars_solution, Cvars_solution, graph_data, save_root):
-        
+        os.makedirs(save_root, exist_ok=True)
         if not self.only_discrete:
             Ivars_solution_list = torch.split(Ivars_solution, (graph_data['Ivars'].ptr[1:] - graph_data['Ivars'].ptr[:-1]).cpu().tolist())
             Cvars_solution_list = torch.split(Cvars_solution, (graph_data['Cvars'].ptr[1:] - graph_data['Cvars'].ptr[:-1]).cpu().tolist())
-            Ivars_solution_list = [x.cpu().numpy() for x in Ivars_solution_list]
-            Cvars_solution_list = [x.cpu().numpy() for x in Cvars_solution_list]
+            Ivars_solution_list = [x.detach().cpu().numpy() for x in Ivars_solution_list]
+            Cvars_solution_list = [x.detach().cpu().numpy() for x in Cvars_solution_list]
             
             for i, name in enumerate(graph_data['name']):
-                dealed_name = name.replace('.mps.gz', '_pred.pkl')
-                with open(os.path.join(save_root, dealed_name), 'wb') as f:
-                    pickle.dump({'Ivars': Ivars_solution_list[i], 'Cvars': Cvars_solution_list[i]}, f)
+                extension = get_file_extension(name)
+                dealed_name = os.path.basename(name[:-len(extension)] if extension else name) + '_pred.pkl'
+                prediction = {'Ivars': Ivars_solution_list[i], 'Cvars': Cvars_solution_list[i]}
+                _atomic_write(os.path.join(save_root, dealed_name),
+                              lambda stream: pickle.dump(prediction, stream))
         else:
             Ivars_solution_list = torch.split(Ivars_solution, (graph_data['Ivars'].ptr[1:] - graph_data['Ivars'].ptr[:-1]).cpu().tolist())
-            Ivars_solution_list = [x.cpu().numpy() for x in Ivars_solution_list]
+            Ivars_solution_list = [x.detach().cpu().numpy() for x in Ivars_solution_list]
             
             for i, name in enumerate(graph_data['name']):
-                dealed_name = name.replace('.mps.gz', '_pred.pkl')
-                with open(os.path.join(save_root, dealed_name), 'wb') as f:
-                    pickle.dump({'Ivars': Ivars_solution_list[i]}, f)
+                extension = get_file_extension(name)
+                dealed_name = os.path.basename(name[:-len(extension)] if extension else name) + '_pred.pkl'
+                prediction = {'Ivars': Ivars_solution_list[i]}
+                _atomic_write(os.path.join(save_root, dealed_name),
+                              lambda stream: pickle.dump(prediction, stream))
         
     def pure_inference_parallel(self, batch, batch_idx, draw=False, split='test'):
-        # start_time = time.time()
-        graph_data = duplicate_hetero_data(batch, 32)
-        Ivars_solution = graph_data.extract_Ivars_label()
-        Cvars_solution = graph_data.extract_Cvars_label()
-        shape_Cvars = Cvars_solution.shape
-        shape_Ivars = Ivars_solution.shape
-        graph_data.input_Ivars_label_(self.DFM.x_0_sample(shape_Ivars))
-        graph_data.input_Cvars_label_(self.CFM.x_0_sample(shape_Cvars))
-
-        pred_Ivars, pred_Cvars = self.inference_core(graph_data)
-        # predict_labels_mask = predict_labels_mask
-        pred_Ivars_sample = torch.multinomial(pred_Ivars, 1).reshape(-1)
-        graph_data.input_Ivars_label_(pred_Ivars_sample)
-        graph_data.input_Cvars_label_(pred_Cvars)
-        feasibility = cal_feasibility_graph(graph_data, reduction=False)
-        print('The feasibility is ', feasibility)
-        cost = cal_objective_graph(graph_data, reduction=False)
-        print('The cost is ', cost)
-        batchsize = len(graph_data['name'])
-        
- 
-        Cvar_mse = F.mse_loss(pred_Cvars, Cvars_solution.float()).item()
-        Ivar_ce = F.cross_entropy(pred_Ivars, Ivars_solution.long()).item()
-        metrics = {'metric': Cvar_mse + Ivar_ce, 'Cvar_mse': Cvar_mse, 'Ivar_ce': Ivar_ce}
-        # metrics = metrics | {'cost_time_per_graph': 0}
-
-        for key, value in metrics.items():
-            self.log(f"{split}/{key}", value, on_epoch=True, sync_dist=True, batch_size=batchsize)
-
-        if self.args.save_predictions:
-            self.save_labels(pred_Ivars, pred_Cvars, graph_data, self.save_pred_root)
-
-        return metrics
+        graph_data = duplicate_hetero_data(batch, self.R)
+        if 'name' in graph_data:
+            names = []
+            for index, name in enumerate(graph_data['name']):
+                extension = get_file_extension(name)
+                stem = name[:-len(extension)] if extension else name
+                names.append(f'{stem}_sample{index}{extension}')
+            graph_data['name'] = names
+        return self.inference_batch(graph_data, batch_idx, draw=draw, split=split)
 
     def inference_parallel(self, batch, batch_idx, draw=False, split='test'):
         with torch.no_grad():
+            batch.only_discrete = self.only_discrete
             batchsize = len(batch['Ivars'].ptr[1:])
             assert batchsize == 1
             Ivars_solution = batch.extract_Ivars_label()
-            Cvars_solution = batch.extract_Cvars_label()
-            shape_Cvars = Cvars_solution.shape
             shape_Ivars = Ivars_solution.shape
             batch.input_Ivars_label_(self.DFM.x_0_sample(shape_Ivars))
-            batch.input_Cvars_label_(self.CFM.x_0_sample(shape_Cvars))
+            if not self.only_discrete:
+                Cvars_solution = batch.extract_Cvars_label()
+                batch.input_Cvars_label_(self.CFM.x_0_sample(Cvars_solution.shape))
             pred_Ivars, pred_Cvars = self.guided_inference_core(batch)
             # predict_labels_mask = predict_labels_mask
             pred_Ivars_sample = torch.multinomial(pred_Ivars, 1).reshape(-1)
             batch.input_Ivars_label_(pred_Ivars_sample)
-            batch.input_Cvars_label_(pred_Cvars)
+            if not self.only_discrete:
+                batch.input_Cvars_label_(pred_Cvars)
             feasibility = cal_feasibility_graph(batch, reduction=False)
             # print('The feasibility is ', feasibility)
             cost = cal_objective_graph(batch, reduction=False)
@@ -457,9 +499,9 @@ class GMIPModel(COMetaModel):
             batchsize = len(batch['name'])
             
     
-            Cvar_mse = F.mse_loss(pred_Cvars, Cvars_solution.float()).item()
-            Ivar_ce = F.cross_entropy(pred_Ivars, Ivars_solution.long()).item()
-            metrics = {'metric': Cvar_mse + Ivar_ce, 'Cvar_mse': Cvar_mse, 'Ivar_ce': Ivar_ce}
+            Cvar_mse = F.mse_loss(pred_Cvars, Cvars_solution.float()).item() if not self.only_discrete and Cvars_solution.numel() else 0.0
+            Ivar_ce = F.nll_loss(pred_Ivars.clamp_min(1e-12).log(), Ivars_solution.long()).item()
+            metrics = {'metric': -(Cvar_mse + Ivar_ce), 'Cvar_mse': Cvar_mse, 'Ivar_ce': Ivar_ce}
             metrics = metrics | {'feasibility': feasibility[0].item(), 'cost': cost[0].item()}
             for key, value in metrics.items():
                 self.log(f"{split}/{key}", value, on_epoch=True, sync_dist=True, batch_size=batchsize)
@@ -470,8 +512,19 @@ class GMIPModel(COMetaModel):
         return metrics
     
     def inference(self, batch:GraphMILP, guidance=False, batchsize=1):
+        if not isinstance(batchsize, int) or isinstance(batchsize, bool) or batchsize < 1:
+            raise ValueError("batchsize must be a positive integer")
+        # Dataset items can share storage with their cache; never overwrite
+        # the caller's ground-truth labels with inference noise or predictions.
+        batch = batch.clone()
         with torch.no_grad():
             batch.only_discrete = self.only_discrete
+            if guidance and batchsize > 1:
+                samples = [self.inference(batch.clone(), guidance=True) for _ in range(batchsize)]
+                return {
+                    'Ivars': np.stack([sample['Ivars'] for sample in samples]),
+                    'Cvars': np.stack([sample['Cvars'] for sample in samples]) if not self.only_discrete else None,
+                }
             
             if batchsize > 1:
                 graph = duplicate_hetero_data(batch, batchsize)
@@ -485,7 +538,7 @@ class GMIPModel(COMetaModel):
                     graph.input_Cvars_label_(self.CFM.x_0_sample(shape_Cvars))
                 pred_Ivars, pred_Cvars = self.inference_core(graph)
                 return {
-                    'Ivars': pred_Ivars.reshape(batchsize, -1, 2).cpu().numpy(),
+                    'Ivars': pred_Ivars.reshape(batchsize, -1, self.max_integer_num).cpu().numpy(),
                     'Cvars': pred_Cvars.reshape(batchsize, -1).cpu().numpy() if not self.only_discrete else None,
                 }
             
@@ -514,33 +567,45 @@ class GMIPModel(COMetaModel):
         if self.only_discrete:
             for i in range(steps):
                 t_start, t_end = self.inference_scheduler(i)
-                t_start = torch.tensor([t_start], device=self.device)
-                t_end = torch.tensor([t_end], device=self.device)
+                t_start = torch.tensor([t_start], device=self.device, dtype=self.dtype)
+                t_end = torch.tensor([t_end], device=self.device, dtype=self.dtype)
                 pred_Ivars = self.discrete_denoise_step(graph_data, t_start, t_end)
+                if t_end >= 1:
+                    return pred_Ivars, None
                 if i != steps - 1:
                     graph_data.input_Ivars_label_(pred_Ivars)
                 pred_Cvars = None
         else:    
             for i in range(steps):
                 t_start, t_end = self.inference_scheduler(i)
-                t_start = torch.tensor([t_start], device=self.device)
-                t_end = torch.tensor([t_end], device=self.device)
+                t_start = torch.tensor([t_start], device=self.device, dtype=self.dtype)
+                t_end = torch.tensor([t_end], device=self.device, dtype=self.dtype)
                 pred_Ivars, pred_Cvars = self.mixed_denoise_step(graph_data, t_start, t_end)
+                if t_end >= 1:
+                    return pred_Ivars, pred_Cvars
                 if i != steps - 1:
                     graph_data.input_Ivars_label_(pred_Ivars)
                     graph_data.input_Cvars_label_(pred_Cvars)
 
         return pred_Ivars, pred_Cvars
     
+    @torch.inference_mode(False)
     @torch.no_grad()
     def guided_inference_core(self, graph_data:GraphMILP):
+        # Lightning may call validation inside inference_mode. Clone after
+        # disabling it so guidance can save ordinary tensors for backward.
+        graph_data = graph_data.clone()
+        if getattr(graph_data, 'num_graphs', 1) != 1:
+            raise ValueError("Guided inference requires a single graph")
         steps = self.inference_steps
         # Perform diffusion steps
         for i in range(steps):
             t_start, t_end = self.inference_scheduler(i)
-            t_start = torch.tensor([t_start], device=self.device)
-            t_end = torch.tensor([t_end], device=self.device)
+            t_start = torch.tensor([t_start], device=self.device, dtype=self.dtype)
+            t_end = torch.tensor([t_end], device=self.device, dtype=self.dtype)
             pred_Ivars, pred_Cvars = self.multimodal_guided_denoise_step_TFG(graph_data, t_start, t_end)
+            if t_end >= 1:
+                return pred_Ivars, pred_Cvars
             if i != steps - 1:
                 graph_data.input_Ivars_label_(pred_Ivars)
                 if not self.only_discrete:

@@ -1,9 +1,15 @@
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import gurobipy as gp
 import os
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from fmip.utils.gp_utils import pred_by_model
+from fmip.utils.gp_utils import pred_by_model, load_policy_checkpoint
 import copy
 from gurobipy import GRB
 import time
@@ -11,6 +17,7 @@ import pickle
 from fmip.pl_gmip_model import GMIPModel
 from fmip.utils.milp_reader import MIPmodel
 from fmip.utils.arg import default_args
+from fmip.utils.solver_validation import binary_probabilities, validate_trust_region, load_test_instances
 
 time_points = []
 iter_points = []
@@ -27,10 +34,14 @@ def save_history(model, where):
             iter_points.append(current_iteration)
 
 class PredsearchOptimizer:
-    def __init__(self, root_dir, problem_set, policy_path, set_threads = None, timelimit = 600, guidance = False, sense = "min"):
+    def __init__(self, root_dir, problem_set, policy_path, set_threads = None, timelimit = 600, guidance = False, sense = "min",
+                 split_path=None, instance_limit=None):
         self.root_dir = root_dir
         self.problem_root = os.path.join(root_dir, problem_set, 'problem')
+        self.split_path = split_path
+        self.instance_limit = instance_limit
         self.sense = sense
+        self.problem_set = problem_set
         self.load_policy(policy_path)
         self.result_dict = {}
         self.set_threads = set_threads
@@ -40,16 +51,7 @@ class PredsearchOptimizer:
         self.solving_history_dict = {}
 
     def load_policy(self, policy_path):
-        args = default_args()
-        args.sense = self.sense
-        args.max_integer_num = 2
-        if problem_set in ["load_balance", "item_placement"] and "gnn" not in policy_path:
-            args.only_discrete = False
-        else:
-            args.only_discrete = True
-        self.policy = GMIPModel.load_from_checkpoint(policy_path, param_args=args, load_datasets=False)  
-        self.policy.eval()
-        self.policy.to('cuda')
+        self.policy = load_policy_checkpoint(policy_path, sense=self.sense)
 
     
     def _get_variable_info(self, model: gp.Model):
@@ -70,6 +72,7 @@ class PredsearchOptimizer:
                                   param):
         """Apply predsearch strategy for warm start"""
         k_0, k_1, delta_rate = param
+        validate_trust_region(k_0, k_1, delta_rate)
 
         self.MIPModel = MIPmodel(os.path.join(self.problem_root, prob_name))
         model = gp.read(os.path.join(self.problem_root, prob_name))
@@ -77,12 +80,13 @@ class PredsearchOptimizer:
         pred_Ivars_prob = pred_solution['Ivars']
         
         vars_list, Ivars_indice, _ = self._get_variable_info(model)
+        pred_Ivars_prob = binary_probabilities(pred_Ivars_prob, [vars_list[i] for i in Ivars_indice])
 
         max_prob_Ivars = pred_Ivars_prob[:,0] - pred_Ivars_prob[:,1]
         pred_Ivars = np.argmax(pred_Ivars_prob, axis=1)
         sorted_idx = np.argsort(max_prob_Ivars)[::-1]
 
-        if k_1 != 0:
+        if int(len(sorted_idx) * k_1) > 0:
             fixed_1_ind = sorted_idx[-int(len(sorted_idx) * k_1):]
             pred_Ivars[fixed_1_ind] = 1
         else:
@@ -106,7 +110,7 @@ class PredsearchOptimizer:
                 model.addConstr(Ivars_list[idx] <= alpha[i])
             elif pred_x_i == 1:
                 model.addConstr(1 - Ivars_list[idx] <= alpha[i])
-        model.addConstr(gp.quicksum(alpha) <= delta)
+        model.addConstr(gp.quicksum(alpha.values()) <= delta)
         model.update()
 
         if self.set_threads is not None:
@@ -115,9 +119,9 @@ class PredsearchOptimizer:
             model.setParam('Timelimit', self.timelimit)
 
         time0 = time.time()
-        model.optimize()
+        model.optimize(save_history)
 
-        if model.Status in [gp.GRB.INFEASIBLE, gp.GRB.UNBOUNDED]:
+        if model.SolCount == 0:
             best_model = None
         else:
             best_model = model
@@ -137,9 +141,9 @@ class PredsearchOptimizer:
                 result['predsearch_iter'] = best_model.IterCount
             self.result_dict[str(param)][prob_name] = result
             self.solving_history_dict[str(param)][prob_name] = {}
-            self.solving_history_dict[str(param)][prob_name]['time'] = time_points
-            self.solving_history_dict[str(param)][prob_name]['iter'] = iter_points
-            self.solving_history_dict[str(param)][prob_name]['obj'] = obj_values
+            self.solving_history_dict[str(param)][prob_name]['time'] = time_points.copy()
+            self.solving_history_dict[str(param)][prob_name]['iter'] = iter_points.copy()
+            self.solving_history_dict[str(param)][prob_name]['obj'] = obj_values.copy()
             time_points.clear()
             iter_points.clear()
             obj_values.clear()
@@ -152,9 +156,9 @@ class PredsearchOptimizer:
         """Process all prediction files"""
         self.result_dict = {str(para): {} for para in params}
         self.solving_history_dict = {str(para): {} for para in params}
-        with open(f'/data/GM4MILP/dataset_split/{self.problem_set}/split.pkl', 'rb') as f:
-            split = pickle.load(f)['test']
-        prob_name_list = np.sort(split)[0:10]
+        prob_name_list = load_test_instances(
+            self.problem_root, self.split_path,
+            getattr(self.policy.args, 'dataset_cache', None), self.instance_limit)
         for prob_name in tqdm(prob_name_list):
             self.process_instance_predsearch(prob_name, params)
                 
@@ -162,9 +166,10 @@ class PredsearchOptimizer:
     
     def save_all_results(self, prefix='warmstart_result'):
         """Save all results to CSV"""
-        # for param, result in self.result_dict.items():
-        #     df = pd.DataFrame(result).T
-        #     df.to_csv(f'{prefix}_{str(param)}.csv')
+        os.makedirs(os.path.dirname(prefix) or '.', exist_ok=True)
+        for param, result in self.result_dict.items():
+            df = pd.DataFrame(result).T
+            df.to_csv(f'{prefix}_{str(param)}.csv')
         for param, history in self.solving_history_dict.items():
             with open(f'{prefix}_{str(param)}_history.pkl', 'wb') as f:
                 pickle.dump(history, f)
@@ -221,6 +226,7 @@ if __name__ == "__main__":
         policy_folder = os.path.join(policy_root, save_folders, "checkpoints")
         policy_path = os.path.join(policy_folder, np.sort(os.listdir(policy_folder))[2])
         
-        optimizer = PredsearchOptimizer(root_dir, problem_set, policy_path, set_threads = threads, timelimit = Timelimit, guidance = guidance, sense= sense)
+        optimizer = PredsearchOptimizer(root_dir, problem_set, policy_path, set_threads = threads, timelimit = Timelimit, guidance = guidance, sense= sense,
+                                        split_path=f'/data/GM4MILP/dataset_split/{problem_set}/split.pkl', instance_limit=10)
         optimizer.run_all(params)
         optimizer.save_all_results(prefix = f'downstream_result/predsearch/{source}_predsearch_solve_{problem_set}{"_guidance" if guidance and source == "diff" else ""}')

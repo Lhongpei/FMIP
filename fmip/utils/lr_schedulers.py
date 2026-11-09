@@ -9,6 +9,8 @@ def get_schedule_fn(scheduler, num_training_steps):
     """Returns a callable scheduler_fn(optimizer).
     Todo: Sanitize and unify these schedulers...
     """
+    if num_training_steps <= 0:
+        raise ValueError("num_training_steps must be positive")
     if scheduler == "cosine-decay":
         scheduler_fn = partial(
             torch.optim.lr_scheduler.CosineAnnealingLR,
@@ -27,11 +29,17 @@ def get_schedule_fn(scheduler, num_training_steps):
 
 def get_one_cycle(optimizer, num_training_steps):
     """Simple single-cycle scheduler. Not including paper/fastai three-phase things or asymmetry."""
+    if num_training_steps <= 0:
+        raise ValueError("num_training_steps must be positive")
 
     def lr_lambda(current_step):
+        # A one-update run has no separate warmup phase. Starting at zero
+        # would otherwise leave every parameter unchanged for the whole run.
+        if num_training_steps == 1:
+            return 1.0 if current_step == 0 else 0.0
         if current_step < num_training_steps / 2:
             return float(current_step / (num_training_steps / 2))
         else:
-            return float(2 - current_step / (num_training_steps / 2))
+            return max(0.0, float(2 - current_step / (num_training_steps / 2)))
 
     return LambdaLR(optimizer, lr_lambda, -1)

@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 # from MIPGNN.global_vars import *
 # from main_utils import *
 from fmip.utils.mvb import *
@@ -15,7 +21,8 @@ from tqdm import tqdm
 from fmip.pl_gmip_model import GMIPModel
 from fmip.utils.milp_reader import MIPmodel
 from fmip.utils.arg import default_args
-from fmip.utils.gp_utils import pred_by_model
+from fmip.utils.gp_utils import pred_by_model, load_policy_checkpoint
+from fmip.utils.solver_validation import load_test_instances, history_path
 from gurobipy import GRB
 time_points = []
 iter_points = []
@@ -32,12 +39,16 @@ def save_history(model, where):
             iter_points.append(current_iteration)
 
 class MVBOptimizer:
-    def __init__(self, root_dir, problem_set, policy_path, args, source, set_threads = None, timelimit = None, guidance = False, sense = "min"):
+    def __init__(self, root_dir, problem_set, policy_path, args, source, set_threads = None, timelimit = None, guidance = False, sense = "min",
+                 split_path=None, instance_limit=None):
         self.root_dir = root_dir
         self.sense = sense
+        self.problem_set = problem_set
         self.load_policy(policy_path)
         self.source = source
         self.problem_root = os.path.join(root_dir, problem_set, 'problem')
+        self.split_path = split_path
+        self.instance_limit = instance_limit
         self.result_dict = {}
         self.set_threads = set_threads
         self.timelimit = timelimit
@@ -47,16 +58,7 @@ class MVBOptimizer:
         self.solving_history = {}
 
     def load_policy(self, policy_path):
-        args = default_args()
-        args.sense = self.sense
-        args.max_integer_num = 2
-        if problem_set in ["load_balance", "item_placement"] and "gnn" not in policy_path:
-            args.only_discrete = False
-        else:
-            args.only_discrete = True
-        self.policy = GMIPModel.load_from_checkpoint(policy_path, param_args=args, load_datasets=False)  
-        self.policy.eval()
-        self.policy.to('cuda')
+        self.policy = load_policy_checkpoint(policy_path, sense=self.sense)
 
     def _get_variable_info(self, model):
         """Extract variable information from the model"""
@@ -83,15 +85,15 @@ class MVBOptimizer:
         if args.robust:
             mvb_model.setParam("Cuts", 1)
             mvb_model.setParam("MIPFocus", 2)
-        if self.set_threads:
+        if self.set_threads is not None:
             mvb_model.setParam("Threads", self.set_threads)
-        if self.timelimit:
+        if self.timelimit is not None:
             mvb_model.setParam("Timelimit", self.timelimit)
 
         start_time = time.time()
 
         mvb_model.optimize(save_history)
-        if mvb_model.Status in [gp.GRB.INFEASIBLE, gp.GRB.UNBOUNDED]:
+        if mvb_model.SolCount == 0:
             mvbObjVal = None
             mvbIter = None
         else:
@@ -135,16 +137,15 @@ class MVBOptimizer:
            
     def run_all(self):
         """Process all prediction files"""
-        prob_name_list = os.listdir(self.problem_root)
-        with open(f'/data/GM4MILP/dataset_split/{self.problem_set}/split.pkl', 'rb') as f:
-            split = pickle.load(f)['test']
-        prob_name_list = np.sort(split)[:10]
+        prob_name_list = load_test_instances(
+            self.problem_root, self.split_path,
+            getattr(self.policy.args, 'dataset_cache', None), self.instance_limit)
         for prob_name in tqdm(prob_name_list):
             self.result_dict[prob_name] = self.process_instance_mvb(prob_name)
             self.solving_history[prob_name] = {}
-            self.solving_history[prob_name]['time'] = time_points
-            self.solving_history[prob_name]['iter'] = iter_points
-            self.solving_history[prob_name]['obj'] = obj_values
+            self.solving_history[prob_name]['time'] = time_points.copy()
+            self.solving_history[prob_name]['iter'] = iter_points.copy()
+            self.solving_history[prob_name]['obj'] = obj_values.copy()
             time_points.clear()
             iter_points.clear()
             obj_values.clear()
@@ -152,9 +153,10 @@ class MVBOptimizer:
         return pd.DataFrame(self.result_dict).T
 
     def save_results(self, output_file='warmstart_result.csv'):
+        os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
         df = pd.DataFrame(self.result_dict).T
         df.to_csv(output_file)
-        with open(output_file.replace('.csv', '_history.pkl'), 'wb') as f:
+        with open(history_path(output_file), 'wb') as f:
             pickle.dump(self.solving_history, f)
         return df
 
@@ -212,6 +214,7 @@ if __name__ == "__main__":
         policy_folder = os.path.join(policy_root, save_folders, "checkpoints")
         policy_path = os.path.join(policy_folder, np.sort(os.listdir(policy_folder))[2 if source == "diff" else 3])
 
-        optimizer = MVBOptimizer(root_dir, problem_set, policy_path, args, source, set_threads = threads, timelimit = 600, guidance = guidance, sense = sense)
+        optimizer = MVBOptimizer(root_dir, problem_set, policy_path, args, source, set_threads = threads, timelimit = 600, guidance = guidance, sense = sense,
+                                 split_path=f'/data/GM4MILP/dataset_split/{problem_set}/split.pkl', instance_limit=10)
         df = optimizer.run_all()
         optimizer.save_results(f'downstream_result/mvb/{source}_mvb_solve_{problem_set}_{str(param)}{"_guidance" if guidance and source == "diff" else ""}.csv')

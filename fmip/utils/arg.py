@@ -2,7 +2,7 @@ import argparse
 import os
 import time
 from argparse import ArgumentParser
-def default_args():
+def default_args(argv=()):
     parser = ArgumentParser(
         description="Train a Pytorch-Lightning diffusion model on a TSP dataset."
     )
@@ -15,10 +15,10 @@ def default_args():
     parser.add_argument("--validation_split", type=str, default="valid")
     parser.add_argument("--test_split", type=str, default="test")
     parser.add_argument("--validation_examples", type=int, default=-1) #Note -1 means all examples
-    parser.add_argument("--inference_type", type=str, default="batch")
+    parser.add_argument("--inference_type", choices=("batch", "parallel"), default="batch")
 
     parser.add_argument(
-        "--c_d_weight", type=float, default=1.0, help="Weight for the discrete loss."
+        "--c_d_weight", type=float, default=1.0, help="Weight for the continuous loss."
     )
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--num_epochs", type=int, default=300)
@@ -70,11 +70,13 @@ def default_args():
     parser.add_argument("--save_predictions", action="store_true")
     parser.add_argument("--mode", type=str, default="primal")
     parser.add_argument("--only_discrete", action="store_true")
-    parser.add_argument("--sense", type=str, default="min")
+    parser.add_argument("--max_integer_num", type=int, default=None,
+                        help="Total output classes, including the reserved mask class in mask mode.")
+    parser.add_argument("--sense", choices=("min", "max"), default="min")
     
     parser.add_argument("--extra_name_wandb", type=str, default="")
     parser.add_argument("--use_focal_loss", action="store_true")
-    parser.add_argument("--ce_weight", type=list, default=None)
+    parser.add_argument("--ce_weight", type=float, nargs='+', default=None)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return args

@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import gurobipy as gp
 from gurobipy import GRB
 import os
@@ -6,11 +12,12 @@ import pandas as pd
 from tqdm import tqdm
 from fmip.pl_gmip_model import GMIPModel
 from fmip.utils.milp_reader import MIPmodel
-from fmip.utils.gp_utils import pred_by_model
+from fmip.utils.gp_utils import pred_by_model, load_policy_checkpoint
 import copy
 import pickle
 import time
 from fmip.utils.arg import default_args
+from fmip.utils.solver_validation import binary_probabilities, validate_trust_region, load_test_instances
 
 time_points = []
 iter_points = []
@@ -18,7 +25,7 @@ obj_values = []
 
 def save_history(model, where):
     if where == GRB.Callback.MIP:
-        current_time = model.cbGet(GRB.Callback.RUNTIME)
+        current_time = model.cbGet(GRB.Callback.RUNTIME) + getattr(model, '_history_time_offset', 0.0)
         if len(time_points) == 0 or current_time - time_points[-1] >= 1:
             current_obj = model.cbGet(GRB.Callback.MIP_OBJBST)
             current_iteration = model.cbGet(GRB.Callback.MIP_ITRCNT)
@@ -27,9 +34,12 @@ def save_history(model, where):
             iter_points.append(current_iteration)
 
 class ApolloOptimizer:
-    def __init__(self, root_dir, problem_set, policy_path, set_threads = None, timelimit = None, guidance = False, sense = "min"):
+    def __init__(self, root_dir, problem_set, policy_path, set_threads = None, timelimit = None, guidance = False, sense = "min",
+                 split_path=None, instance_limit=None):
         self.root_dir = root_dir
         self.problem_root = os.path.join(root_dir, problem_set, 'problem')
+        self.split_path = split_path
+        self.instance_limit = instance_limit
         self.sense = sense
         self.problem_set = problem_set
         self.load_policy(policy_path)
@@ -43,16 +53,7 @@ class ApolloOptimizer:
 
 
     def load_policy(self, policy_path):
-        args = default_args()
-        args.sense = self.sense
-        args.max_integer_num = 2
-        if self.problem_set in ["load_balance", "item_placement"] and "gnn" not in policy_path:
-            args.only_discrete = False
-        else:
-            args.only_discrete = True
-        self.policy = GMIPModel.load_from_checkpoint(policy_path, param_args=args, load_datasets=False)  
-        self.policy.eval()
-        self.policy.to('cuda')
+        self.policy = load_policy_checkpoint(policy_path, sense=self.sense)
     
     def _get_variable_info(self, model: gp.Model):
         """Extract variable information from the model"""
@@ -74,14 +75,18 @@ class ApolloOptimizer:
                                   k_1,
                                   delta_rate):
         """Apply predsearch strategy for warm start"""
+        validate_trust_region(k_0, k_1, delta_rate)
+        if self.timelimit is not None and self.timelimit <= 0:
+            return None, None
 
         vars_list, Ivars_indice, _ = self._get_variable_info(model)
+        pred_Ivars_prob = binary_probabilities(pred_Ivars_prob, [vars_list[i] for i in Ivars_indice])
 
         max_prob_Ivars = pred_Ivars_prob[:,0] - pred_Ivars_prob[:,1]
         pred_Ivars = np.argmax(pred_Ivars_prob, axis=1)
         sorted_idx = np.argsort(max_prob_Ivars)[::-1]
 
-        if k_1 != 0:
+        if int(len(sorted_idx) * k_1) > 0:
             fixed_1_ind = sorted_idx[-int(len(sorted_idx) * k_1):]
             pred_Ivars[fixed_1_ind] = 1
         else:
@@ -103,23 +108,23 @@ class ApolloOptimizer:
                 model.addConstr(Ivars_list[idx] <= alpha[i])
             elif pred_x_i == 1:
                 model.addConstr(1 - Ivars_list[idx] <= alpha[i])
-        model.addConstr(gp.quicksum(alpha) <= delta)
+        model.addConstr(gp.quicksum(alpha.values()) <= delta)
         model.update()
 
         if self.set_threads is not None:
             model.setParam('Threads', self.set_threads)
         if self.timelimit is not None:
-            model.setParam('Timelimit', max(1, min(self.timelimit, 400)))
+            model.setParam('Timelimit', min(self.timelimit, 400))
 
         time0 = time.time()
         model.optimize(save_history)
 
-        if model.Status in [gp.GRB.INFEASIBLE, gp.GRB.UNBOUNDED]:
+        if model.SolCount == 0:
             best_model = None
             bin_solution = None
         else:
             best_model = model
-            bin_solution = [var.X for var in best_model.getVars() if var.VType == gp.GRB.BINARY]
+            bin_solution = [vars_list[i].X for i in Ivars_indice]
         solving_time = time.time() - time0
 
         if self.timelimit is not None:
@@ -137,9 +142,9 @@ class ApolloOptimizer:
                 result['apollo_obj'] = best_model.ObjVal
             self.result_dict[str(param)][prob_name] = result
             self.solving_history_dict[str(param)][prob_name] = {}
-            self.solving_history_dict[str(param)][prob_name]['time'] = time_points
-            self.solving_history_dict[str(param)][prob_name]['iter'] = iter_points
-            self.solving_history_dict[str(param)][prob_name]['obj'] = obj_values
+            self.solving_history_dict[str(param)][prob_name]['time'] = time_points.copy()
+            self.solving_history_dict[str(param)][prob_name]['iter'] = iter_points.copy()
+            self.solving_history_dict[str(param)][prob_name]['obj'] = obj_values.copy()
             time_points.clear()
             iter_points.clear()
             obj_values.clear()
@@ -154,7 +159,7 @@ class ApolloOptimizer:
         model = gp.read(problem_path)
         self.MIPModel = MIPmodel(problem_path)
         param = np.array(param)
-        if_fixed = np.zeros(len(model.getVars()), dtype = np.bool)
+        if_fixed = np.zeros(len(model.getVars()), dtype=bool)
 
         if len(param.shape) == 1:
             k_0, k_1, delta_rate, epoch = param
@@ -172,22 +177,33 @@ class ApolloOptimizer:
         best_obj = np.inf if model.ModelSense == gp.GRB.MINIMIZE else -np.inf
 
         time0 = time.time()
+        budget = self.timelimit
 
         for i in range(epoch):
+            if budget is not None:
+                self.timelimit = max(0, budget - (time.time() - time0))
+                if self.timelimit <= 0:
+                    break
             model_pred = model.copy()
             pred_solution = self.get_prediction(model_pred)
+            if budget is not None:
+                self.timelimit = max(0, budget - (time.time() - time0))
+                if self.timelimit <= 0:
+                    break
+            model_pred._history_time_offset = time.time() - time0
             pred_Ivars_prob = pred_solution['Ivars']
             model_solved, bin_solution = self.apply_predsearch_strategy(model_pred,
                                                                         pred_Ivars_prob,
                                                                         k_0s[i],
                                                                         k_1s[i],
                                                                         delta_rates[i])
-            if model_solved and \
-                (model.ModelSense == gp.GRB.MINIMIZE and model_solved.ObjVal < best_obj) or \
-                (model.ModelSense == gp.GRB.MAXIMIZE and model_solved.ObjVal > best_obj):
+            if model_solved is not None and (
+                (model.ModelSense == gp.GRB.MINIMIZE and model_solved.ObjVal < best_obj) or
+                (model.ModelSense == gp.GRB.MAXIMIZE and model_solved.ObjVal > best_obj)
+            ):
                 best_obj = model_solved.ObjVal
                 best_model = model_solved
-            if i < epoch - 1:
+            if i < epoch - 1 and bin_solution is not None:
                 intersect_ind = np.where(np.argmax(pred_Ivars_prob, axis = 1) == bin_solution)[0]
                 if intersect_ind.size > 0:
                     self.fix_by_ind(model, intersect_ind, np.argmax(pred_Ivars_prob, axis = 1))
@@ -197,7 +213,8 @@ class ApolloOptimizer:
         return best_model, solving_time 
 
     def fix_by_ind(self, model: gp.Model, index, pred_solution):
-        vars_list = model.getVars()
+        all_vars, integer_indices, _ = self._get_variable_info(model)
+        vars_list = [all_vars[i] for i in integer_indices]
         for i in index:
             vars_list[i].LB = pred_solution[i]
             vars_list[i].UB = pred_solution[i]
@@ -205,9 +222,9 @@ class ApolloOptimizer:
 
     def run_all(self, params: list):
         """Process all prediction files"""
-        with open(f'/data/GM4MILP/dataset_split/{self.problem_set}/split.pkl', 'rb') as f:
-            split = pickle.load(f)['test']
-        prob_name_list = np.sort(split)[:10]
+        prob_name_list = load_test_instances(
+            self.problem_root, self.split_path,
+            getattr(self.policy.args, 'dataset_cache', None), self.instance_limit)
         self.result_dict = {str(para): {} for para in params}
         self.solving_history_dict = {str(para): {} for para in params}
         for prob_name in tqdm(prob_name_list):
@@ -217,6 +234,7 @@ class ApolloOptimizer:
     
     def save_all_results(self, prefix='warmstart_result'):
         """Save all results to CSV"""
+        os.makedirs(os.path.dirname(prefix) or '.', exist_ok=True)
         for param, result in self.result_dict.items():
             df = pd.DataFrame(result).T
             df.to_csv(f'{prefix}_{str(param)}.csv')
@@ -275,6 +293,7 @@ if __name__ == "__main__":
         policy_folder = os.path.join(policy_root, save_folders, "checkpoints")
         policy_path = os.path.join(policy_folder, np.sort(os.listdir(policy_folder))[2])
         
-        optimizer = ApolloOptimizer(root_dir, problem_set, policy_path, set_threads = threads, timelimit = 600, guidance = guidance, sense = sense)
+        optimizer = ApolloOptimizer(root_dir, problem_set, policy_path, set_threads = threads, timelimit = 600, guidance = guidance, sense = sense,
+                                    split_path=f'/data/GM4MILP/dataset_split/{problem_set}/split.pkl', instance_limit=10)
         optimizer.run_all(params)
         optimizer.save_all_results(prefix = f'downstream_result/apollo/{source}_apollo_{problem_set}{"_guidance" if guidance and source == "diff" else ""}')

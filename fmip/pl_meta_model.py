@@ -9,27 +9,44 @@ import torch.utils.data
 from torch_geometric.loader import DataLoader as GraphDataLoader
 from torch_geometric.data import Batch
 from pytorch_lightning.utilities import rank_zero_info
-from utils.lr_schedulers import get_schedule_fn
-from utils.flow_scheduler import DiscreteFlow, ContinuousFlow, InferenceScheduler
-from dataset import SplitSchedule, GraphMILPDataset
+from fmip.utils.lr_schedulers import get_schedule_fn
+from fmip.utils.flow_scheduler import DiscreteFlow, ContinuousFlow, InferenceScheduler
+from fmip.dataset import SplitSchedule, GraphMILPDataset
+from fmip.utils.milp_utils import duplicate_hetero_data
 import os
-from utils.lp_utils import *
+from argparse import Namespace
+from fmip.utils.lp_utils import *
 
 class COMetaModel(pl.LightningModule):
-    def __init__(self, param_args, load_datasets=True):
+    def __init__(self, param_args=None, load_datasets=True):
         super(COMetaModel, self).__init__()
         self.Cvars_dim = 6
         self.Ivars_dim = 6
         self.cons_dim = 1
-        self.args = param_args
+        if param_args is None:
+            raise ValueError("param_args must be supplied, or restored from checkpoint hyperparameters")
+        self.args = Namespace(**param_args) if isinstance(param_args, dict) else copy.deepcopy(param_args)
         self.c_d_weight = self.args.c_d_weight
         self.only_discrete = self.args.only_discrete
         if load_datasets:
             self.load_datasets()
-            self.max_integer_num = self.test_dataset.max_integer_num
-            print("Number of classes:", self.max_integer_num)
-        if hasattr(self.args, "max_integer_num"):
+            self.max_integer_num = max(
+                dataset.max_integer_num for dataset in
+                (self.train_dataset, self.validation_dataset, self.test_dataset)
+            )
+            if self.args.discrete_flow_mode == "mask":
+                self.max_integer_num += 1  # Reserve a class that is never a clean label.
+        if getattr(self.args, "max_integer_num", None) is not None:
+            if load_datasets and self.args.max_integer_num < self.max_integer_num:
+                raise ValueError("max_integer_num does not cover the dataset's integer domain and reserved mask")
             self.max_integer_num = self.args.max_integer_num
+        if not hasattr(self, "max_integer_num"):
+            raise ValueError("max_integer_num is required when load_datasets=False")
+        if self.max_integer_num < (2 if self.args.discrete_flow_mode == "mask" else 1):
+            raise ValueError("The classifier must contain real classes and, in mask mode, a reserved mask")
+        self.args.max_integer_num = self.max_integer_num
+        # Restoring a checkpoint for inference must not need the training data.
+        self.save_hyperparameters({"param_args": self.args, "load_datasets": False})
         self.DFM = DiscreteFlow(
             max_integer_num=self.max_integer_num,
             mode=self.args.discrete_flow_mode,
@@ -41,8 +58,7 @@ class COMetaModel(pl.LightningModule):
         
         if self.args.save_predictions:
             self.save_pred_root = os.path.join(self.args.storage_path, "predictions", self.args.dataset_name)
-            if not os.path.exists(self.save_pred_root):
-                os.makedirs(self.save_pred_root)
+            os.makedirs(self.save_pred_root, exist_ok=True)
         
         self.num_training_steps_cached = None
         self.inference_steps = self.args.inference_steps
@@ -52,28 +68,38 @@ class COMetaModel(pl.LightningModule):
         )
 
     def load_datasets(self):
-        if not os.path.exists(self.args.dataset_cache):
-            os.makedirs(self.args.dataset_cache)
+        os.makedirs(self.args.dataset_cache, exist_ok=True)
         file_root = os.path.join(
             self.args.dataset_root, self.args.dataset_name
         )  #'/data/GM4MILP/datasets/load_balancing_tiny'
         saved_path = os.path.join(
             self.args.dataset_cache, self.args.dataset_name
         )  #'dataset_cache/load_balancing_tiny'
-        if not os.path.exists(saved_path):
-            os.makedirs(saved_path)
+        os.makedirs(saved_path, exist_ok=True)
         split = SplitSchedule(file_root, saved_path)
         split_dict = split.get_split()
+        train_split = getattr(self.args, "training_split", "train")
+        valid_split = getattr(self.args, "validation_split", "valid")
+        test_split = getattr(self.args, "test_split", "test")
+        for name in (train_split, valid_split, test_split):
+            if name not in split_dict:
+                raise ValueError(f"Unknown dataset split {name!r}; available splits: {list(split_dict)}")
+        train_files = split_dict[train_split]
+        limit = getattr(self.args, "select_num_train_instance", None)
+        if limit is not None:
+            if limit <= 0:
+                raise ValueError("select_num_train_instance must be positive")
+            train_files = train_files[:limit]
         self.train_dataset = GraphMILPDataset(
-            file_root, saved_path, file_name_list=split_dict["train"], prefix="train",
+            file_root, saved_path, file_name_list=train_files, prefix="train",
         )
         self.problem_root = self.train_dataset.problem_root
         self.solution_root = self.train_dataset.solution_root
         self.validation_dataset = GraphMILPDataset(
-            file_root, saved_path, file_name_list=split_dict["valid"], prefix="valid",
+            file_root, saved_path, file_name_list=split_dict[valid_split], prefix="valid",
         )
         self.test_dataset = GraphMILPDataset(
-            file_root, saved_path, file_name_list=split_dict["test"], prefix="test",
+            file_root, saved_path, file_name_list=split_dict[test_split], prefix="test",
         )
 
 
@@ -82,21 +108,9 @@ class COMetaModel(pl.LightningModule):
         """Total training steps inferred from datamodule and devices."""
         if self.num_training_steps_cached is not None:
             return self.num_training_steps_cached
-        dataset = self.train_dataloader()
-        if self.trainer.max_steps and self.trainer.max_steps > 0:
-            return self.trainer.max_steps
-      
-        dataset_size = (
-            self.trainer.limit_train_batches * len(dataset)
-            if self.trainer.limit_train_batches != 0
-            else len(dataset)
-        )
-
-        num_devices = max(1, self.trainer.num_devices)
-        effective_batch_size = self.trainer.accumulate_grad_batches * num_devices
-        self.num_training_steps_cached = (
-            dataset_size // effective_batch_size
-        ) * self.trainer.max_epochs
+        # Lightning accounts for distributed sampling, batch limits, accumulation,
+        # and the final partial accumulation step.
+        self.num_training_steps_cached = int(self.trainer.estimated_stepping_batches)
         return self.num_training_steps_cached
 
     def configure_optimizers(self):
@@ -133,9 +147,7 @@ class COMetaModel(pl.LightningModule):
     def duplicate_hetero_data(self, heterodata, times, device):
         """Duplicate the edge index (in sparse graphs) for parallel sampling."""
 
-        return Batch.from_data_list(
-            [copy.deepcopy(heterodata) for _ in range(times)]
-        )
+        return duplicate_hetero_data(heterodata, times).to(device)
 
     def train_dataloader(self):
         batch_size = self.args.batch_size
@@ -145,8 +157,8 @@ class COMetaModel(pl.LightningModule):
             shuffle=True,
             num_workers=self.args.num_workers,
             pin_memory=True,
-            persistent_workers=True,
-            drop_last=True,
+            persistent_workers=self.args.num_workers > 0,
+            drop_last=False,
         )
         return train_dataloader
 
@@ -166,7 +178,8 @@ class COMetaModel(pl.LightningModule):
         )
         if self.args.validation_examples > 0:
             val_dataset = torch.utils.data.Subset(
-                self.validation_dataset, range(self.args.validation_examples)
+                self.validation_dataset,
+                range(min(self.args.validation_examples, len(self.validation_dataset)))
             )
         else:
             val_dataset = self.validation_dataset

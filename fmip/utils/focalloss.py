@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 '''
 See:
 https://github.com/clcarwin/focal_loss_pytorch/tree/master
@@ -27,13 +26,12 @@ class FocalLoss(nn.Module):
         logpt = F.log_softmax(input, dim=1)
         logpt = logpt.gather(1,target)
         logpt = logpt.view(-1)
-        pt = Variable(logpt.data.exp())
+        pt = logpt.exp()
 
         if self.alpha is not None:
-            if self.alpha.type()!=input.data.type():
-                self.alpha = self.alpha.type_as(input.data)
-            at = self.alpha.gather(0,target.data.view(-1))
-            logpt = logpt * Variable(at)
+            alpha = self.alpha.to(device=input.device, dtype=input.dtype)
+            at = alpha.gather(0, target.view(-1))
+            logpt = logpt * at
 
         loss = -1 * (1-pt)**self.gamma * logpt
         if self.size_average: return loss.mean()

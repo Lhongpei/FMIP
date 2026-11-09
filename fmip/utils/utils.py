@@ -7,19 +7,25 @@ def generate_unique_samples(pred_Ivars, K, max_attempts=1000):
     K: Number of unique samples to generate (Can be higher than K).
     max_attempts: Maximum attempts to generate unique samples.
     """
-    unique_sample = set()
+    if not isinstance(K, int) or K < 0 or not isinstance(max_attempts, int) or max_attempts < 0:
+        raise ValueError("K and max_attempts must be nonnegative integers")
+    if K == 0:
+        return np.empty((0, len(pred_Ivars)), dtype=np.int64)
+    unique_sample = {}
     with torch.no_grad():
-        pred_Ivars = torch.tensor(pred_Ivars, device='cuda' if torch.cuda.is_available() else 'cpu')
+        pred_Ivars = torch.as_tensor(pred_Ivars)
+        if not pred_Ivars.is_floating_point():
+            pred_Ivars = pred_Ivars.float()
         sampled_Ivars = torch.multinomial(pred_Ivars, K, replacement=True).T
-        unique_sample.update(set(map(tuple, sampled_Ivars.cpu().tolist())))
+        unique_sample.update(dict.fromkeys(map(tuple, sampled_Ivars.cpu().tolist())))
         attempts = 0
         while len(unique_sample) < K and attempts < max_attempts:
             sampled_Ivars = torch.multinomial(pred_Ivars, K, replacement=True).T
-            unique_sample.update(set(map(tuple, sampled_Ivars.cpu().tolist())))
+            unique_sample.update(dict.fromkeys(map(tuple, sampled_Ivars.cpu().tolist())))
             attempts += 1
         if len(unique_sample) < K:
             print(f"Warning: Only {len(unique_sample)} unique samples generated out of {K} requested.")
-    return np.array(list(unique_sample))
+    return np.array(list(unique_sample)[:K], dtype=np.int64)
 
 def get_file_extension(filename):
     base, ext = os.path.splitext(filename)
@@ -34,7 +40,8 @@ def get_file_extension(filename):
 
 def find_respect_solution(solution_root, problem_name):
     file_type = get_file_extension(problem_name)
-    solution_path = os.path.join(solution_root, problem_name.replace(file_type, '_sol.pkl'))
+    stem = problem_name[:-len(file_type)] if file_type else problem_name
+    solution_path = os.path.join(solution_root, stem + '_sol.pkl')
     return solution_path
 
 def at(a, t, x):
@@ -49,7 +56,8 @@ def at(a, t, x):
     Returns:
         torch.Tensor: Extracted coefficients, shape = (batch_size, ..., num_pixel_vals).
     """
-    a = a.to(dtype=torch.float32)  # Convert to float32 if necessary
+    a = a.to(device=x.device, dtype=torch.float32)
+    t = t.to(device=x.device, dtype=torch.long)
     t_broadcast = t.view(t.shape + (1,) * (x.dim() - 1))  # Broadcast t to match the leading dimensions of x
 
     # Advanced indexing for selecting values
@@ -67,7 +75,8 @@ def at_onehot(a, t, x):
     Returns:
         torch.Tensor: Result of the dot product of x with a[t], shape = (batch_size, ..., num_pixel_vals).
     """
-    a = a.to(dtype=torch.float32)  # Convert to float32 if necessary
+    a = a.to(device=x.device, dtype=x.dtype)
+    t = t.to(device=x.device, dtype=torch.long)
 
     # Gather `a` along the 0th dimension using `t` as indices
     a_t = a[t]  # a_t.shape = (batch_size, num_pixel_vals, num_pixel_vals)
@@ -76,5 +85,5 @@ def at_onehot(a, t, x):
     # x.shape = (batch_size, ..., num_pixel_vals)
     # a_t.shape = (batch_size, num_pixel_vals, num_pixel_vals)
     # out.shape = (batch_size, ..., num_pixel_vals)
-    out = torch.einsum('...i,bij->...j', x, a_t)  # Batch matrix multiplication
+    out = torch.einsum('b...i,bij->b...j', x, a_t)
     return out

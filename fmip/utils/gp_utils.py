@@ -1,10 +1,57 @@
 import gurobipy as gp
 import torch
 import numpy as np
-from pl_gmip_model import GMIPModel
-from utils.milp_reader import MIPmodel
-from dataset import toHeteroData
-from utils.lp_utils import recover_basis_np, transform_to_equalities, recover_basis_logits
+import copy
+from fmip.pl_gmip_model import GMIPModel
+from fmip.utils.milp_reader import MIPmodel
+from fmip.dataset import toHeteroData
+from fmip.utils.lp_utils import recover_basis_np, transform_to_equalities, recover_basis_logits
+from fmip.utils.arg import default_args
+
+
+def checkpoint_model_args(checkpoint, runtime_args=None):
+    """Restore model semantics while retaining caller data and execution settings."""
+    state = checkpoint["state_dict"]
+    args = default_args() if runtime_args is None else copy.deepcopy(runtime_args)
+    saved = checkpoint.get("hyper_parameters", {}).get("param_args", {})
+    saved = saved if isinstance(saved, dict) else vars(saved)
+    if runtime_args is None:
+        args.__dict__.update(saved)
+    else:
+        # These settings determine the meaning of the learned weights, even
+        # when different settings happen to produce identical tensor shapes.
+        model_settings = ("hidden_dim", "n_layers", "max_integer_num", "only_discrete",
+                          "discrete_flow_mode", "flow_schedule", "use_focal_loss",
+                          "ce_weight", "c_d_weight")
+        for name in model_settings:
+            if name in saved:
+                setattr(args, name, saved[name])
+    required = ("model.x_Ivars_linear.0.weight", "model.Iout_layer.2.weight")
+    if any(key not in state for key in required):
+        raise ValueError("Checkpoint does not contain a supported FMIP graph model")
+    args.hidden_dim = state[required[0]].shape[0]
+    args.max_integer_num = state[required[1]].shape[0]
+    layer_indices = [int(key.split(".")[2]) for key in state if key.startswith("model.conv_vars2cons.")]
+    args.n_layers = max(layer_indices) + 1 if layer_indices else 0
+    if layer_indices:
+        args.only_discrete = not any(key.startswith("model.conv_cons2Cvars.") for key in state)
+    if "discrete_loss.weight" in state:
+        args.ce_weight = state["discrete_loss.weight"].tolist()
+    return args
+
+
+def load_policy_checkpoint(policy_path, sense="min", device=None):
+    """Restore inference configuration, including legacy checkpoints without hparams."""
+    checkpoint = torch.load(policy_path, map_location="cpu", weights_only=False)
+    args = checkpoint_model_args(checkpoint)
+    args.sense = sense
+    args.save_predictions = False
+    policy = GMIPModel(param_args=args, load_datasets=False)
+    policy.load_state_dict(checkpoint["state_dict"])
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    return policy.eval().to(device)
+
 def gurobi_basis_warm_start(file_path, var_basis, con_basis):
     m = gp.read(file_path)
     m.setParam('LPWarmStart', 2)
@@ -14,7 +61,7 @@ def gurobi_basis_warm_start(file_path, var_basis, con_basis):
     m.optimize()
     metrics = {}
     metrics['status'] = m.status
-    metrics['obj'] = m.ObjVal
+    metrics['obj'] = m.ObjVal if m.SolCount else None
     metrics['solving_time'] = m.Runtime
     metrics['iterations'] = m.IterCount
     return metrics
@@ -33,18 +80,25 @@ def extract_primal_solution(model):
         solution.append(var.x)
     return solution
 
-def pred_by_model(mip_model: MIPmodel, model, guidance = False, device = 'cuda', parallel_size = 1):
+def pred_by_model(mip_model: MIPmodel, model, guidance = False, device = None, parallel_size = 1):
+    if device is None:
+        device = getattr(model, "device", "cpu")
     data = mip_model.generGraphCom()
     graph = toHeteroData(data['x_cons'], data['x_Cvars'], data['x_Ivars'], 
                                         data['C2cons_edge_attr'], data['I2cons_edge_attr'],
-                                        data['C2cons_edge_index'], data['I2cons_edge_index']).to(device)
-    if isinstance(model, GMIPModel):
-        result = model.inference(graph, guidance = guidance, batchsize = parallel_size)
-
-
-    return result
+                                        data['C2cons_edge_index'], data['I2cons_edge_index'],
+                                        model_sense=data.get('model_sense', 1),
+                                        objective_constant=data.get('objective_constant', 0.)).to(device)
+    if not callable(getattr(model, "inference", None)):
+        raise TypeError("Prediction model must provide an inference method")
+    return model.inference(graph, guidance=guidance, batchsize=parallel_size)
 
 def pred_FMIPump(name, model:GMIPModel, guidance = False, device = 'cuda'):
+    if not callable(getattr(model, "inference_FMIPump", None)):
+        raise NotImplementedError(
+            "FMIPump is not implemented by GMIPModel. Use pred_by_model for "
+            "predictions and a downstream solver to construct feasible solutions."
+        )
     data = MIPmodel(name).generGraphCom()
     graph = toHeteroData(data['x_cons'], data['x_Cvars'], data['x_Ivars'], 
                                         data['C2cons_edge_attr'], data['I2cons_edge_attr'],

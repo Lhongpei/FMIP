@@ -37,7 +37,8 @@ class LinearEncoder(nn.Module):
         
 
     def forward(self, x):
-        x = self.layer(x)
+        for layer in self.layer:
+            x = layer(x)
         return x
     
 class PreNormException(Exception):
@@ -159,6 +160,8 @@ class TripartiteGCNConv(MessagePassing):
         self.use_residual = use_residual
 
     def forward(self, src1_features, src2_features, edge_indices, edge_features, target_features):
+        if target_features.shape[0] == 0:
+            return target_features
         if self.use_residual:
             residual = target_features
 
@@ -206,7 +209,7 @@ class TripartiteGCNConv(MessagePassing):
         trans_target = self.feature_module_target(node_features_j)
 
         combined = trans_target + trans_src + trans_edge
-        combined = self.combined_linear(combined)  # 使用预定义的线性层
+        combined = self.combined_linear(combined)  # Apply the predefined linear layer.
  
         def create_message(combined_input):
             return self.feature_module_final(combined_input)
@@ -216,7 +219,7 @@ class TripartiteGCNConv(MessagePassing):
             output = checkpoint(
                 create_message, 
                 combined,
-                use_reentrant=True  # Recommended setting
+                use_reentrant=False  # Also supports guidance via autograd.grad.
             )
         else:
             output = create_message(combined)
@@ -299,7 +302,7 @@ class BipartiteGCNConv(MessagePassing):
             output = checkpoint(
                 create_message, 
                 combined,
-                use_reentrant=True  # Recommended setting
+                use_reentrant=False  # Also supports guidance via autograd.grad.
             )
         else:
             output = create_message(combined)
@@ -314,4 +317,3 @@ class BipartiteGCNConv(MessagePassing):
 #         self.feature_module_left = nn.Linear(emb_size, emb_size, bias=True)
 #         self.feature_module_right = nn.Linear(emb_size, emb_size, bias=True)
 #         self.
-        

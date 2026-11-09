@@ -3,6 +3,7 @@ from gurobipy import GRB
 import scipy.sparse as sp
 import torch
 import pickle
+import math
 class MIPmodel:
     """
     Class for reading MILP by Gurobi
@@ -41,9 +42,10 @@ class MIPmodel:
             dict: A dictionary with result attribute names and their values
         """
         self.solve()
-        result_dict = {}
-        for attr in self.resultLis:
-            result_dict[attr] = self.model.getAttr(attr)
+        result_dict = {attr: self.model.getAttr(attr)
+                       for attr in ("Status", "Runtime", "SolCount")}
+        # Objective attributes are unavailable when no incumbent exists.
+        result_dict["ObjVal"] = self.model.ObjVal if self.model.SolCount else None
         return result_dict
 
     def setTimeLimit(self, time):
@@ -94,15 +96,23 @@ class MIPmodel:
             Bipartite graph components
             The input LP format is as follows:
             min     c^T x
-            s.t.    Ax >= b
+            s.t.    Ax <= b
                     x = [x_I, x_C] 
                     l <= x_C <= u
-                    x_I \in {0, 1, ..., K}
+                    x_I in {0, 1, ..., K}
         """
     
-        # try:
+        for attr in ("NumQNZs", "NumQConstrs", "NumGenConstrs", "NumSOS", "NumPWLObjVars"):
+            if getattr(self.model, attr, 0):
+                raise ValueError(f"FMIP graph encoding supports linear MILPs only ({attr} is nonzero)")
+        if getattr(self.model, "NumObj", 1) > 1:
+            raise ValueError("FMIP graph encoding does not support multiple objectives")
         solution = False if solution_info_path is None else True
-        sol_info = pickle.load(open(solution_info_path, 'rb')) if solution else None
+        if solution:
+            with open(solution_info_path, 'rb') as stream:
+                sol_info = pickle.load(stream)
+        else:
+            sol_info = None
         # Generate the constraint matrix as a sparse matrix
         A = sp.csr_matrix(self.model.getA())
         label_info = None if not solution else sol_info['label_info']
@@ -126,18 +136,22 @@ class MIPmodel:
         num_Ivars = 0
         num_Cvars = 0
         for i in range(n):
+            if vars_[i].VType not in (GRB.CONTINUOUS, GRB.INTEGER, GRB.BINARY):
+                raise ValueError(f"Unsupported variable type {vars_[i].VType!r} for {vars_[i].VarName}")
             varLB = vars_[i].LB
             varUB = vars_[i].UB
             hasLB = 1
             hasUB = 1
-            if varLB == float('-inf'):
+            if varLB <= -GRB.INFINITY:
                 varLB = 0
                 hasLB = 0
-            if varUB == float('inf'):
+            if varUB >= GRB.INFINITY:
                 varUB = 0
                 hasUB = 0
             obj = vars_[i].Obj
             label = 0 if not solution else label_info[vars_[i].VarName]
+            if not math.isfinite(label):
+                raise ValueError(f"Non-finite solution value for {vars_[i].VarName}")
             assert float('-inf') < varLB < float('inf')
             assert float('-inf') < varUB < float('inf')
             assert float('-inf') < obj < float('inf')
@@ -147,8 +161,16 @@ class MIPmodel:
                 Cvars_indices[i] = num_Cvars
                 num_Cvars += 1
             else:
+                if not hasLB or math.ceil(varLB) < 0:
+                    raise ValueError("FMIP requires nonnegative integer domains")
+                if solution:
+                    rounded = round(label)
+                    if abs(label - rounded) > 1e-5:
+                        raise ValueError(f"Nonintegral solution label for {vars_[i].VarName}: {label}")
+                    label = rounded
+                    if label < varLB - 1e-5 or (hasUB and label > varUB + 1e-5):
+                        raise ValueError(f"Solution label outside bounds for {vars_[i].VarName}")
                 x_Ivars.append([varLB, varUB, obj, hasLB, hasUB, label])
-                Ivars_indices[num_Ivars] = i
                 Ivars_indices[i] = num_Ivars
                 num_Ivars += 1
                 
@@ -157,31 +179,38 @@ class MIPmodel:
             start_idx = indptr[i]
             end_idx = indptr[i + 1]
 
-            UB = constrs[i].RHS
-            x_cons.append([UB])
-
-            
-            for k in range(start_idx, end_idx):
-                if data[k] == 0:
-                    continue 
-                
-                var_idx = indices[k]
-                if vars_[var_idx].VType == GRB.CONTINUOUS:
-                    C2cons_edge_attr.append([data[k]])
-                    C2cons_edge_index[1].append(i)
-                    C2cons_edge_index[0].append(Cvars_indices[var_idx])
-                else:
-                    I2cons_edge_attr.append([data[k]])
-                    I2cons_edge_index[1].append(i)
-                    I2cons_edge_index[0].append(Ivars_indices[var_idx])
+            # The graph feasibility functions use Ax <= b. Equalities need
+            # both inequalities because the graph stores no separate sense.
+            sense = constrs[i].Sense
+            if sense not in (GRB.EQUAL, GRB.GREATER_EQUAL, GRB.LESS_EQUAL):
+                raise ValueError(f"Unsupported constraint sense: {sense!r}")
+            signs = (1, -1) if sense == GRB.EQUAL else ((-1,) if sense == GRB.GREATER_EQUAL else (1,))
+            for sign in signs:
+                cons_idx = len(x_cons)
+                x_cons.append([sign * constrs[i].RHS])
+                for k in range(start_idx, end_idx):
+                    if data[k] == 0:
+                        continue
+                    var_idx = indices[k]
+                    if vars_[var_idx].VType == GRB.CONTINUOUS:
+                        C2cons_edge_attr.append([sign * data[k]])
+                        C2cons_edge_index[1].append(cons_idx)
+                        C2cons_edge_index[0].append(Cvars_indices[var_idx])
+                    else:
+                        I2cons_edge_attr.append([sign * data[k]])
+                        I2cons_edge_index[1].append(cons_idx)
+                        I2cons_edge_index[0].append(Ivars_indices[var_idx])
         # Convert to tensors for PyTorch
-        x_cons = torch.tensor(x_cons, dtype=torch.float)
-        x_Cvars = torch.tensor(x_Cvars, dtype=torch.float)
-        x_Ivars = torch.tensor(x_Ivars, dtype=torch.float)
-        C2cons_edge_attr = torch.tensor(C2cons_edge_attr, dtype=torch.float)
-        I2cons_edge_attr = torch.tensor(I2cons_edge_attr, dtype=torch.float)
+        x_cons = torch.tensor(x_cons, dtype=torch.float).reshape(-1, 1)
+        x_Cvars = torch.tensor(x_Cvars, dtype=torch.float).reshape(-1, 6)
+        x_Ivars = torch.tensor(x_Ivars, dtype=torch.float).reshape(-1, 6)
+        C2cons_edge_attr = torch.tensor(C2cons_edge_attr, dtype=torch.float).reshape(-1, 1)
+        I2cons_edge_attr = torch.tensor(I2cons_edge_attr, dtype=torch.float).reshape(-1, 1)
         C2cons_edge_index = torch.tensor(C2cons_edge_index, dtype=torch.long)
         I2cons_edge_index = torch.tensor(I2cons_edge_index, dtype=torch.long)
+        if not all(torch.isfinite(value).all() for value in
+                   (x_cons, x_Cvars, x_Ivars, C2cons_edge_attr, I2cons_edge_attr)):
+            raise ValueError("MILP coefficients or bounds are not representable as finite float32 values")
         
 
         readed_data = {
@@ -192,7 +221,9 @@ class MIPmodel:
             'I2cons_edge_attr': I2cons_edge_attr,
             'C2cons_edge_index': C2cons_edge_index,
             'I2cons_edge_index': I2cons_edge_index,
-            'if_labeled': solution
+            'if_labeled': solution,
+            'model_sense': int(getattr(self.model, 'ModelSense', GRB.MINIMIZE)),
+            'objective_constant': float(getattr(self.model, 'ObjCon', 0.)),
         }
 
         return readed_data

@@ -97,7 +97,33 @@ def normalization(channels):
     :param channels: number of input channels.
     :return: an nn.Module for normalization.
     """
-    return GroupNorm32(32, channels)
+    if channels < 2:
+        raise ValueError("Node normalization requires at least two hidden channels")
+    # At least two channels per group keeps a single-node graph well-defined.
+    # The default 64-channel architecture retains its original 32 groups.
+    groups = math.gcd(32, channels)
+    if groups == channels:
+        groups //= 2
+    return GroupNorm32(groups, channels)
+
+
+def node_output(head, features, batch=None):
+    """Apply a convolutional node head without mixing graphs in GroupNorm."""
+    out_channels = head[-1].out_channels
+    if features.shape[0] == 0:
+        return features.new_empty((0, out_channels))
+
+    def apply_head(nodes):
+        image = nodes.transpose(0, 1).unsqueeze(0).unsqueeze(-1)
+        return head(image).squeeze(0).squeeze(-1).transpose(0, 1)
+
+    if batch is None:
+        return apply_head(features)
+    output = features.new_empty((features.shape[0], out_channels))
+    for graph_id in batch.unique():
+        mask = batch == graph_id
+        output[mask] = apply_head(features[mask])
+    return output
 
 
 def timestep_embedding(timesteps, dim, max_period=10000):

@@ -8,10 +8,17 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 from typing import Union
+import math
 
 import torch
 
 from torch import Tensor
+
+
+def _validate_snr(snr: Tensor) -> Tensor:
+    if torch.isnan(snr).any() or (snr < 0).any():
+        raise ValueError("SNR must be nonnegative and not NaN")
+    return snr
 
 
 @dataclass
@@ -63,7 +70,7 @@ class Scheduler(ABC):
 class ConvexScheduler(Scheduler):
     @abstractmethod
     def __call__(self, t: Tensor) -> SchedulerOutput:
-        """Scheduler for convex paths.
+        r"""Scheduler for convex paths.
 
         Args:
             t (Tensor): times in [0,1], shape (...).
@@ -75,7 +82,7 @@ class ConvexScheduler(Scheduler):
 
     @abstractmethod
     def kappa_inverse(self, kappa: Tensor) -> Tensor:
-        """
+        r"""
         Computes :math:`t` from :math:`\kappa_t`.
 
         Args:
@@ -96,7 +103,8 @@ class ConvexScheduler(Scheduler):
         Returns:
             Tensor: t, shape (...)
         """
-        kappa_t = snr / (1.0 + snr)
+        snr = _validate_snr(snr)
+        kappa_t = torch.where(torch.isinf(snr), torch.ones_like(snr), snr / (1.0 + snr))
 
         return self.kappa_inverse(kappa=kappa_t)
 
@@ -143,6 +151,9 @@ class VPScheduler(Scheduler):
     """Variance Preserving Scheduler."""
 
     def __init__(self, beta_min: float = 0.1, beta_max: float = 20.0) -> None:
+        if not (math.isfinite(beta_min) and math.isfinite(beta_max)
+                and 0 < beta_min <= beta_max):
+            raise ValueError("VP beta values must satisfy 0 < beta_min <= beta_max")
         self.beta_min = beta_min
         self.beta_max = beta_max
         super().__init__()
@@ -155,16 +166,23 @@ class VPScheduler(Scheduler):
 
         return SchedulerOutput(
             alpha_t=torch.exp(-0.5 * T),
-            sigma_t=torch.sqrt(1 - torch.exp(-T)),
+            sigma_t=torch.sqrt(-torch.expm1(-T)),
             d_alpha_t=-0.5 * dT * torch.exp(-0.5 * T),
-            d_sigma_t=0.5 * dT * torch.exp(-T) / torch.sqrt(1 - torch.exp(-T)),
+            d_sigma_t=0.5 * dT * torch.exp(-T) / torch.sqrt(-torch.expm1(-T)),
         )
 
     def snr_inverse(self, snr: Tensor) -> Tensor:
-        T = -torch.log(snr**2 / (snr**2 + 1))
+        snr = _validate_snr(snr)
+        # log(1 + 1 / snr**2), without overflow from squaring large SNR.
+        T = torch.logaddexp(torch.zeros_like(snr), -2 * torch.log(snr))
         b = self.beta_min
         B = self.beta_max
-        t = 1 - ((-b + torch.sqrt(b**2 + 2 * (B - b) * T)) / (B - b))
+        if B == b:
+            return 1 - T / b
+        # Rationalization avoids cancellation near t=1.
+        delta = 2 * T / (b + torch.sqrt(b**2 + 2 * (B - b) * T))
+        delta = torch.where(torch.isinf(T), T, delta)
+        t = 1 - delta
         return t
 
 
@@ -180,7 +198,9 @@ class LinearVPScheduler(Scheduler):
         )
 
     def snr_inverse(self, snr: Tensor) -> Tensor:
-        return torch.sqrt(snr**2 / (1 + snr**2))
+        snr = _validate_snr(snr)
+        return torch.where(torch.isinf(snr), torch.ones_like(snr),
+                           snr / torch.hypot(snr, torch.ones_like(snr)))
 
 
 class CosineScheduler(Scheduler):
@@ -188,12 +208,13 @@ class CosineScheduler(Scheduler):
 
     def __call__(self, t: Tensor) -> SchedulerOutput:
         pi = torch.pi
+        sigma = torch.where(t == 1, torch.zeros_like(t), torch.cos(pi / 2 * t))
         return SchedulerOutput(
             alpha_t=torch.sin(pi / 2 * t),
-            sigma_t=torch.cos(pi / 2 * t),
-            d_alpha_t=pi / 2 * torch.cos(pi / 2 * t),
+            sigma_t=sigma,
+            d_alpha_t=pi / 2 * sigma,
             d_sigma_t=-pi / 2 * torch.sin(pi / 2 * t),
         )
 
     def snr_inverse(self, snr: Tensor) -> Tensor:
-        return 2.0 * torch.atan(snr) / torch.pi
+        return 2.0 * torch.atan(_validate_snr(snr)) / torch.pi

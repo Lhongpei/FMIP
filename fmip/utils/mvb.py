@@ -6,6 +6,7 @@ Implementation of PMVB framework.
 import numpy as np
 from gurobipy import *
 import gurobipy as gp
+from fmip.utils.solver_validation import binary_probabilities, require_binary_domains
 # import coptpy as cp
 
 ## utils
@@ -135,7 +136,7 @@ class MVB(object):
         # elif solver == "copt":
         #     self._registerCOPTModel(model)
         else:
-            self._registerSCIPModel(model)
+            raise NotImplementedError("Only the Gurobi solver is supported")
 
         self._mvbmodel = self._cloneModel()
         print("Model has been registered")
@@ -147,13 +148,14 @@ class MVB(object):
         if self._modelStatus != self.MVB_MODEL_INITIALIZED:
             raise RuntimeError("Model is not initialized")
 
-        if len(varIdx) > self._ndim:
+        if len(varIdx) != len(set(varIdx)) or any(i < 0 or i >= self._ndim for i in varIdx):
             raise RuntimeError("Variable index cannot exceed the "
                                " total number of variables")
         self._varIdx = varIdx
 
         if self._solver == self.MVB_SOLVER_GUROBI:
             self._vars = [self._mvbmodel.getVars()[i] for i in self._varIdx]
+            require_binary_domains(self._vars)
         # elif self._solver == self.MVB_SOLVER_COPT:
         #     self._vars = [self._mvbmodel.getVars()[i] for i in self._varIdx]
         else:   
@@ -217,6 +219,7 @@ class MVB(object):
             feature = self._getFeature(self._model).reshape(-1, 1)
             Xpred = self._predictor(self._learner, feature)
 
+        Xpred = binary_probabilities(Xpred, self._vars)
         (fixUpIdx, fixLowIdx) = self._getFixIdx(Xpred, self._fixratio)
         self._fixLowIdx = fixLowIdx
         self._fixUpIdx = fixUpIdx
@@ -247,7 +250,9 @@ class MVB(object):
 
             # Warm-start
             if i == 0 and warm:
-                start = np.zeros(self._ndim)
+                start = np.full(len(self._varIdx), GRB.UNDEFINED)
+                start[self._fixUpIdx] = 1.0
+                start[self._fixLowIdx] = 0.0
                 start[mvbUpIdx] = 1.0
                 start[mvbLowIdx] = 0.0
                 self._setWarmStart(start)
@@ -262,9 +267,10 @@ class MVB(object):
                             gap=0.005):
 
         if self._solver == self.MVB_SOLVER_GUROBI:
-            vars = model.getVars()
+            vars = [model.getVars()[i] for i in self._varIdx]
             if self._fixratio > 0:
                 self._fixVars(model, self._fixLowIdx, isUpper=False)
+                self._fixVars(model, self._fixUpIdx, isUpper=True)
 
             if upCut and len(up_id) > 0:
                 if up:
@@ -344,7 +350,11 @@ class MVB(object):
         assert (nRegion == len(pSuccessLow))
         assert (nRegion == len(pSuccessUp))
 
-        for i in range(nRegion - 1):
+        if not 0 <= fixratio <= 0.5:
+            raise ValueError("fixratio fixes this fraction at each bound and must be in [0, 0.5]")
+        if any(not 0 < p < 1 for p in [*pSuccessLow, *pSuccessUp]):
+            raise ValueError("Success probabilities must lie strictly between zero and one")
+        for i in range(nRegion):
             if tmvb[i] < tmvb[i + 1]:
                 raise RuntimeError("tmvb must be a descending array")
 
@@ -418,7 +428,8 @@ class MVB(object):
         Get MVB indices
 
         """
-        sorted_indices = np.argsort(Xpred)
+        probabilities = Xpred[:, 1] if Xpred.ndim == 2 else Xpred
+        sorted_indices = np.argsort(probabilities)
         if nUp == 0:
             mvbUpIdx = np.array([]).astype(int)
         else:
@@ -431,8 +442,8 @@ class MVB(object):
         mvbUpIdx = np.setdiff1d(mvbUpIdx, self._fixUpIdx, assume_unique=True)
         mvbLowIdx = np.setdiff1d(mvbLowIdx, self._fixLowIdx, assume_unique=True)
 
-        mvbUpProb = Xpred[mvbUpIdx]
-        mvbLowProb = Xpred[mvbLowIdx]
+        mvbUpProb = probabilities[mvbUpIdx]
+        mvbLowProb = probabilities[mvbLowIdx]
 
         return mvbUpIdx, mvbUpProb, mvbLowIdx, mvbLowProb
     
@@ -455,9 +466,6 @@ class MVB(object):
             ksiUp = np.minimum(ksiUp, int(nUpVars/5))
         ksiLow = np.sum(mvbLowProb) + np.sqrt(nLowVars * np.log(1 / np.maximum(pFailLow, 1e-20)) / 2)
         ksiLow = np.maximum(ksiLow, 0)
-        if pFailLow >= 0.5:
-            ksiLow = 0
-
         return ksiUp, ksiLow
 
     def _addCut(self, varIdx, bound, isGeq):

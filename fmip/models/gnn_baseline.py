@@ -1,13 +1,14 @@
 import numpy as np
 import torch
 import math
-from dataset import GraphMILP
+from fmip.dataset import GraphMILP
 import torch.nn as nn
-from models.layers import FourierEncoder, LinearEncoder, PreNormLayer, BipartiteGCNConv, TripartiteGCNConv
-from models.nn import (
+from fmip.models.layers import FourierEncoder, LinearEncoder, PreNormLayer, BipartiteGCNConv, TripartiteGCNConv
+from fmip.models.nn import (
     linear,
     zero_module,
     normalization,
+    node_output,
     timestep_embedding,
 )
 class MILPGCNNonRes(nn.Module):
@@ -123,7 +124,9 @@ class MILPGCNNonRes(nn.Module):
         I2cons_edge_attr: torch.Tensor,
         C2cons_edge_index: torch.Tensor,
         I2cons_edge_index: torch.Tensor,
-        timesteps
+        timesteps,
+        Ivars_batch=None,
+        Cvars_batch=None,
         ):
         x_Cvars_shape = x_Cvars.shape
         x_Ivars_shape = x_Ivars.shape
@@ -166,12 +169,8 @@ class MILPGCNNonRes(nn.Module):
             x_Cvars = time_emb_tmp[broadcast_dim_Ivars: ] + out_layer_Cvars(x_Cvars)
             x_cons = out_layer_cons(x_cons)
 
-        x_Ivars = x_Ivars.reshape(1, x_Ivars_shape[0], -1, x_Ivars.shape[-1]).permute(0, 3, 1, 2)
-        x_Cvars = x_Cvars.reshape(1, x_Cvars_shape[0], -1, x_Cvars.shape[-1]).permute(0, 3, 1, 2)
-        x_cons = x_cons.reshape(1, x_cons_shape[0], -1, x_cons.shape[-1]).permute(0, 3, 1, 2)
-
-        x_Ivars_out = self.Iout_layer(x_Ivars).reshape(-1, x_Ivars_shape[0]).permute(1, 0)
-        x_Cvars_out = self.Cout_layer(x_Cvars).reshape(-1, x_Cvars_shape[0]).permute(1, 0).reshape(-1)
+        x_Ivars_out = node_output(self.Iout_layer, x_Ivars, Ivars_batch)
+        x_Cvars_out = node_output(self.Cout_layer, x_Cvars, Cvars_batch).reshape(-1)
         return x_Ivars_out, x_Cvars_out
     
     def _forward_discrete(
@@ -180,7 +179,8 @@ class MILPGCNNonRes(nn.Module):
         x_cons: torch.Tensor,
         I2cons_edge_attr: torch.Tensor,
         I2cons_edge_index: torch.Tensor,
-        timesteps
+        timesteps,
+        Ivars_batch=None,
         ):
         x_Ivars_shape = x_Ivars.shape
         x_cons_shape = x_cons.shape
@@ -218,10 +218,7 @@ class MILPGCNNonRes(nn.Module):
             x_cons = x_cons_in  + out_layer_cons(x_cons)
             # torch.cuda.empty_cache()
 
-        x_Ivars = x_Ivars.reshape(1, x_Ivars_shape[0], -1, x_Ivars.shape[-1]).permute(0, 3, 1, 2)
-        x_cons = x_cons.reshape(1, x_cons_shape[0], -1, x_cons.shape[-1]).permute(0, 3, 1, 2)
-
-        x_Ivars_out = self.Iout_layer(x_Ivars).reshape(-1, x_Ivars_shape[0]).permute(1, 0)
+        x_Ivars_out = node_output(self.Iout_layer, x_Ivars, Ivars_batch)
         return x_Ivars_out, None
     
     def init_params(self):
@@ -251,12 +248,15 @@ class MILPGCNNonRes(nn.Module):
             I2cons_edge_attr=graph['Ivars', 'to', 'cons'].edge_attr,
             C2cons_edge_index=graph['Cvars', 'to', 'cons'].edge_index,
             I2cons_edge_index=graph['Ivars', 'to', 'cons'].edge_index,
-            timesteps=timesteps 
+            timesteps=timesteps,
+            Ivars_batch=getattr(graph['Ivars'], 'batch', None),
+            Cvars_batch=getattr(graph['Cvars'], 'batch', None),
         ) if not self.only_discrete else \
             self._forward_discrete(
                 x_cons=graph['cons'].x,
                 x_Ivars=graph['Ivars'].x,
                 I2cons_edge_attr=graph['Ivars', 'to', 'cons'].edge_attr,
                 I2cons_edge_index=graph['Ivars', 'to', 'cons'].edge_index,
-                timesteps=timesteps
+                timesteps=timesteps,
+                Ivars_batch=getattr(graph['Ivars'], 'batch', None),
             )

@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import gurobipy as gp
 import os
 import pickle
@@ -12,7 +18,8 @@ import torch
 from fmip.pl_gmip_model import GMIPModel
 from fmip.utils.milp_reader import MIPmodel
 from fmip.utils.arg import default_args
-from fmip.utils.gp_utils import pred_by_model
+from fmip.utils.gp_utils import pred_by_model, load_policy_checkpoint
+from fmip.utils.solver_validation import load_test_instances, history_path
 
 time_points_dict = {}
 iter_points_dict = {}
@@ -33,34 +40,29 @@ def save_history(model, where, ind):
 class NeuralDivingOptimizer:
     def __init__(self, root_dir, problem_set, policy_path,
                  solve_original=False, fixed_strategy='random', set_threads = None, timelimit = None,
-                 sample_times = None, fixed_rate = None, guidance = None, sense = "min"):
+                 sample_times = None, fixed_rate = None, guidance = None, sense = "min",
+                 split_path=None, instance_limit=None):
         self.root_dir = root_dir
         self.sense = sense
+        self.problem_set = problem_set
         self.load_policy(policy_path)
         self.problem_root = os.path.join(root_dir, problem_set, 'problem')
+        self.split_path = split_path
+        self.instance_limit = instance_limit
         self.problem_set = problem_set
         self.result_dict = {}
         self.set_threads = set_threads
         self.timelimit = timelimit
         self.guidance = guidance
         self.solve_original = solve_original
-        self.sample_times = sample_times if sample_times else 10
-        self.sample_ratio = fixed_rate if fixed_rate else 0.8
+        self.sample_times = sample_times if sample_times is not None else 10
+        self.sample_ratio = fixed_rate if fixed_rate is not None else 0.8
         assert fixed_strategy in ['random', 'probs']
+        self.fixed_strategy = fixed_strategy
         self.solving_history = {}
         
     def load_policy(self, policy_path):
-        args = default_args()
-        args.max_integer_num = 2
-        args.sense = self.sense
-        if problem_set in ["load_balance", "item_placement"] and "gnn" not in policy_path:
-            args.only_discrete = False
-        else:
-            args.only_discrete = True
-
-        self.policy = GMIPModel.load_from_checkpoint(policy_path, param_args=args, load_datasets=False)  
-        self.policy.eval()
-        self.policy.to('cuda')
+        self.policy = load_policy_checkpoint(policy_path, sense=self.sense)
 
     def _get_variable_info(self, model):
         """Extract variable information from the model"""
@@ -89,18 +91,34 @@ class NeuralDivingOptimizer:
             sample_ratio: Ratio of integer variables to fix in each sample
             
         Returns:
-            tuple: (best_model, max_solving_time) where:
+            tuple: (best_model, solving_time, best_index) where:
                 best_model: The model with the best solution found (or None if all failed)
-                max_solving_time: The maximum optimization time across all samples
+                solving_time: Wall time for the complete parallel search
+                best_index: Index of the sample with the best solution
         """
         # Generate sample batches
-        if fixed_ratio < 1.:
-            fixed_ind_set = [np.random.choice(Ivars_indice, 
+        if not 0 <= fixed_ratio <= 1 or sample_times < 1:
+            raise ValueError("fixed_ratio must be in [0, 1] and sample_times must be positive")
+        pred_Ivars_prob = np.asarray(pred_Ivars_prob, dtype=float)
+        if (pred_Ivars_prob.ndim != 2 or pred_Ivars_prob.shape[0] != len(Ivars_indice)
+                or pred_Ivars_prob.shape[1] == 0):
+            raise ValueError("Expected one categorical probability row per integer variable")
+        if not np.isfinite(pred_Ivars_prob).all() or (pred_Ivars_prob < 0).any():
+            raise ValueError("Predicted probabilities must be finite and nonnegative")
+        row_mass = pred_Ivars_prob.sum(axis=1, keepdims=True)
+        if not np.isfinite(row_mass).all() or (row_mass <= 0).any():
+            raise ValueError("Each integer variable needs positive finite probability mass")
+        pred_Ivars_prob = pred_Ivars_prob / row_mass
+        if getattr(self, 'fixed_strategy', 'random') == 'probs':
+            fixed = np.argsort(-pred_Ivars_prob.max(axis=1), kind='stable')[:int(len(Ivars_indice) * fixed_ratio)]
+            fixed_ind_set = [fixed for _ in range(sample_times)]
+        elif fixed_ratio < 1.:
+            fixed_ind_set = [np.random.choice(len(Ivars_indice),
                                             int(len(Ivars_indice) * fixed_ratio),
                                             replace=False) 
                             for _ in range(sample_times)]
         else:
-            fixed_ind_set = [Ivars_indice for _ in range(sample_times)]
+            fixed_ind_set = [range(len(Ivars_indice)) for _ in range(sample_times)]
             
         pred_Ivars = torch.multinomial(torch.Tensor(pred_Ivars_prob), sample_times, replacement=True).T
         
@@ -116,63 +134,134 @@ class NeuralDivingOptimizer:
             ))
         
         # Function to process a single sample
-        def _process_sample(args):
+        def _process_sample(args, environment):
             path, sample_batch, pred_Ivars, ind = args
-            model = gp.read(path)
-            vars_list = model.getVars()
+            model = gp.read(path, env=environment)
+            try:
+                vars_list = model.getVars()
+                time_points_dict[ind] = []
+                iter_points_dict[ind] = []
+                obj_values_dict[ind] = []
 
-            time_points_dict[ind] = []
-            iter_points_dict[ind] = []
-            obj_values_dict[ind] = []
-            
+                for i in sample_batch:
+                    variable = vars_list[Ivars_indice[i]]
+                    value = pred_Ivars[i].item()
+                    if variable.VType not in (gp.GRB.INTEGER, gp.GRB.BINARY) or not variable.LB <= value <= variable.UB:
+                        raise ValueError("Sampled integer value lies outside the original variable domain")
+                    variable.LB = value
+                    variable.UB = value
 
-            for i in sample_batch:
-                vars_list[i].LB = pred_Ivars[i]
-                vars_list[i].UB = pred_Ivars[i]
+                model.update()
+                model.setParam('Threads', solver_threads)
+                if self.timelimit is not None:
+                    model.setParam('Timelimit', self.timelimit)
 
-            
-            model.update()
-            # model.setParam('OutputFlag', 0)  # Suppress output
-            if self.set_threads is not None:
-                model.setParam('Threads', self.set_threads)
-            if self.timelimit is not None:
-                model.setParam('Timelimit', self.timelimit)
-                
-            def tmp_save_history(model, where, ind = ind):
-                return save_history(model, where, ind)
+                def tmp_save_history(model, where, ind = ind):
+                    return save_history(model, where, ind)
 
-            start_time = time.time()
-            model.optimize(tmp_save_history)
-            solve_time = time.time() - start_time
-            
-            return model, solve_time
+                model.optimize(tmp_save_history)
+            except Exception:
+                model.dispose()
+                raise
+            return model, ind
         
         # Track parallel execution
-        best_obj = float('inf') if self.sense == "min" else float('-inf')
+        if self.sense not in ('min', 'max'):
+            raise ValueError("Invalid sense. Use 'min' or 'max'.")
         best_model = None
-        max_solving_time = 0
         best_ind = 0
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = [executor.submit(_process_sample, args) for args in args_list]
-            
-            for i, future in enumerate(concurrent.futures.as_completed(futures)):
-                sample_model, solve_time = future.result()
-                if solve_time > max_solving_time:
-                    max_solving_time = solve_time
-                if self.sense == "min":
-                    if sample_model.Status not in [gp.GRB.INFEASIBLE, gp.GRB.UNBOUNDED] and sample_model.ObjVal < best_obj:
-                        best_obj = sample_model.ObjVal
-                        best_model = sample_model
-                        best_ind = i
-                elif self.sense == "max":
-                    if sample_model.Status not in [gp.GRB.INFEASIBLE, gp.GRB.UNBOUNDED] and sample_model.ObjVal > best_obj:
-                        best_obj = sample_model.ObjVal
-                        best_model = sample_model
-                        best_ind = i
-                else:
-                    raise ValueError("Invalid sense. Use 'min' or 'max'.")
+        def minimizes(model):
+            model_sense = getattr(model, 'ModelSense', None)
+            if model_sense == gp.GRB.MINIMIZE:
+                return True
+            if model_sense == gp.GRB.MAXIMIZE:
+                return False
+            return self.sense == 'min'
+        # Bound worker concurrency by the allocation, including solver threads.
+        allocated_cpus = int(os.environ.get('SLURM_CPUS_PER_TASK', os.cpu_count() or 1))
+        solver_threads = self.set_threads if self.set_threads is not None else 1
+        workers = min(sample_times, max(1, allocated_cpus // max(1, solver_threads)))
+        # Gurobi environments must be created on the main thread and exclusively
+        # owned by one worker. Keep samples sequential within each environment.
+        def _process_group(task):
+            samples, environment = task
+            group_best, group_index = None, 0
+            candidate = None
+            try:
+                for sample in samples:
+                    candidate, index = _process_sample(sample, environment)
+                    better = candidate.SolCount > 0 and (group_best is None or
+                        (candidate.ObjVal < group_best.ObjVal if minimizes(candidate)
+                         else candidate.ObjVal > group_best.ObjVal))
+                    if better:
+                        if group_best is not None:
+                            group_best.dispose()
+                        group_best, group_index = candidate, index
+                    else:
+                        candidate.dispose()
+                    candidate = None
+            except Exception:
+                if candidate is not None and candidate is not group_best:
+                    candidate.dispose()
+                if group_best is not None:
+                    group_best.dispose()
+                raise
+            return group_best, group_index, environment
+
+        environments = []
+        kept_environment = None
+        search_start = time.time()
+        try:
+            for _ in range(workers):
+                environments.append(gp.Env(params={'Threads': solver_threads}))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = []
+                failure = None
+                for i, environment in enumerate(environments):
+                    try:
+                        futures.append(executor.submit(_process_group, (args_list[i::workers], environment)))
+                    except Exception as error:
+                        failure = error
+                        break
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        sample_model, sample_ind, environment = future.result()
+                    except Exception as error:
+                        if failure is None:
+                            failure = error
+                        continue
+                    # Collect every worker before disposing its environment,
+                    # including successful workers after another worker fails.
+                    if failure is not None:
+                        if sample_model is not None:
+                            sample_model.dispose()
+                        continue
+                    better = sample_model is not None and (best_model is None or
+                        (sample_model.ObjVal < best_model.ObjVal if minimizes(sample_model)
+                         else sample_model.ObjVal > best_model.ObjVal))
+                    if better:
+                        if best_model is not None:
+                            best_model.dispose()
+                        best_model, best_ind = sample_model, sample_ind
+                        kept_environment = environment
+                    elif sample_model is not None:
+                        sample_model.dispose()
+                if failure is not None:
+                    raise failure
+            if best_model is not None:
+                # Preserve the winning model's environment for its remaining lifetime.
+                best_model._fmip_environment = kept_environment
+        except Exception:
+            if best_model is not None:
+                best_model.dispose()
+            kept_environment = None
+            raise
+        finally:
+            for environment in environments:
+                if environment is not kept_environment:
+                    environment.dispose()
         
-        return best_model, max_solving_time, best_ind
+        return best_model, time.time() - search_start, best_ind
     
     def get_prediction(self):
         result = pred_by_model(self.MIPModel, self.policy, self.guidance)
@@ -197,33 +286,43 @@ class NeuralDivingOptimizer:
         self.solving_history[prob_name]['iter'] = iter_points_dict[best_ind]
         self.solving_history[prob_name]['obj'] = obj_values_dict[best_ind]
 
-        if self.solve_original is not None:
-            result['warm_solving_time'] = max_solving_time
-            result['warm_obj'] = best_model.ObjVal if best_model is not None else None
-            result['warm_iter'] = best_model.IterCount if best_model is not None else None
+        result['warm_solving_time'] = max_solving_time
+        result['warm_obj'] = best_model.ObjVal if best_model is not None else None
+        result['warm_iter'] = best_model.IterCount if best_model is not None else None
+        if self.solve_original:
+            if self.set_threads is not None:
+                m_warm.setParam('Threads', self.set_threads)
+            if self.timelimit is not None:
+                m_warm.setParam('TimeLimit', self.timelimit)
+            start = time.time()
+            m_warm.optimize()
+            result['original_solving_time'] = time.time() - start
+            result['original_obj'] = m_warm.ObjVal if m_warm.SolCount else None
+        m_warm.dispose()
+        if best_model is not None:
+            environment = getattr(best_model, '_fmip_environment', None)
+            best_model.dispose()
+            if environment is not None:
+                environment.dispose()
         return result
        
     def run_all(self):
         """Process all prediction files"""
-        with open(f'/data/GM4MILP/dataset_split/{self.problem_set}/split.pkl', 'rb') as f:
-            split = pickle.load(f)['test']
-        prob_name_list = np.sort(split)[:10]
+        prob_name_list = load_test_instances(
+            self.problem_root, self.split_path,
+            getattr(self.policy.args, 'dataset_cache', None), self.instance_limit)
         for prob_name in tqdm(prob_name_list):
-            try:
-                self.result_dict[prob_name] = self.process_instance_sampled(prob_name)
-            except Exception as e:
-                raise e
-                print(f"Error processing {pred_name}: {str(e)}")
-                self.result_dict[pred_name] = {'error': str(e)}
+            self.result_dict[prob_name] = self.process_instance_sampled(prob_name)
                 
         return pd.DataFrame(self.result_dict).T
 
     
     def save_results(self, output_file='warmstart_result.csv'):
         """Save results to CSV"""
+        os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
         df = pd.DataFrame(self.result_dict).T
         df.to_csv(output_file)
-        with open(output_file.replace('.csv', '_history.pkl'), 'wb') as f:
+        with open(history_path(output_file), 'wb') as f:
             pickle.dump(self.solving_history, f)
         return df
 
@@ -252,9 +351,9 @@ if __name__ == "__main__":
                                        sample_times = params[0],
                                        fixed_rate = params[1],
                                        guidance = guidance,
-                                       sense = sense)
+                                       sense = sense,
+                                       split_path=f'/data/GM4MILP/dataset_split/{problem_set}/split.pkl', instance_limit=10)
         df = optimizer.run_all()
         optimizer.save_results(f'./downstream_result/neural_diving/{source}_sample_neural_diving_solve_{problem_set}_{str(params)}{"_guidance" if guidance and source == "diff" else ""}.csv')
         # df = optimizer.run_all_pred_origin()
         # df.to_csv(f'{problem_set}_origin.csv')
-        

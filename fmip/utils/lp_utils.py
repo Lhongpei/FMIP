@@ -3,8 +3,9 @@ import torch.nn as nn
 import numpy as np
 import gurobipy as gp
 from gurobipy import Model, GRB
-from utils.milp_reader import MIPmodel
-from dataset import GraphMILP
+from fmip.utils.milp_reader import MIPmodel
+from fmip.dataset import GraphMILP
+from fmip.utils.milp_utils import constraint_matmul
 from torch_geometric.data import HeteroData
 import torch.nn.functional as F
 '''
@@ -20,13 +21,13 @@ def dual_objective_gradient(predictions:torch.Tensor, std_matrix, right_high_sid
     
      # Compute A^T y
     std_matrix = std_matrix.t()
-    Aty = torch.matmul(std_matrix, predictions)
+    Aty = constraint_matmul(std_matrix, predictions)
 
     # Compute the mask for ReLU
     mask = (-coef + Aty > 0).float()  # Mask: 1 if ReLU is active, else 0
 
     # Compute the gradient
-    gradient = right_high_side - torch.matmul(std_matrix.T, mask)
+    gradient = right_high_side - constraint_matmul(std_matrix.T, mask)
 
     return gradient
 
@@ -55,8 +56,8 @@ def fix_non_basis(m, predictions, coef, lb, ub, confidence = 0.5):
     for i in range(m.NumVars):
         if predictions[i] < confidence:
             fixed_value = lb[i] if coef[i] >= 0 and lb[i] != -np.inf else ub[i]
-            Vars[i].lb = fixed_value  # 下界
-            Vars[i].ub = fixed_value  # 上界
+            Vars[i].lb = fixed_value  # Lower bound
+            Vars[i].ub = fixed_value  # Upper bound
     return m
     # for i in range(m.NumConstrs):
     #     if predictions[i + m.NumVars] > confidence:
@@ -64,64 +65,67 @@ def fix_non_basis(m, predictions, coef, lb, ub, confidence = 0.5):
         
 def transform_to_equalities(model):
     """
-    将 Gurobi 模型中的所有约束转换为 Ax + s = b 形式。
+    Convert all constraints in a Gurobi model to the form Ax + s = b.
     """
-    # 创建新模型
+    # Create a new model.
     new_model = Model("EqualityModel")
     
-    # 复制变量并建立映射
-    var_map = {}  # 用于映射原模型变量到新模型变量
+    # Copy variables and build the mapping.
+    var_map = {}  # Map original variables to their copies.
     for var in model.getVars():
-        new_var = new_model.addVar(lb=var.lb, ub=var.ub, obj=0,  # 暂时不设置目标函数
+        new_var = new_model.addVar(lb=var.lb, ub=var.ub, obj=0,  # Set objective coefficients below.
                                    vtype=var.vtype, name=var.varName)
         var_map[var] = new_var
     new_model.update()
     
-    # 获取约束并转换
+    # Convert the constraints.
     for constr in model.getConstrs():
-        sense = constr.Sense  # 约束类型 (<=, ==, >=)
-        rhs = constr.getAttr("RHS")  # 右侧值
-        row = model.getRow(constr)  # 获取约束的系数
+        sense = constr.Sense  # Constraint sense (<=, ==, >=)
+        rhs = constr.getAttr("RHS")  # Right-hand side
+        row = model.getRow(constr)  # Retrieve the constraint coefficients.
         
-        # 添加松弛变量
-        slack_var = new_model.addVar(lb=0 if sense == '<' else -GRB.INFINITY,
-                                     ub=GRB.INFINITY if sense == '<' else 0,
-                                     name=f"slack_{constr.ConstrName}")
-        
-        # 构建新的等式约束
+        # Add slack variables.
+        # Build the equivalent equality constraint.
         expr = sum(row.getCoeff(i) * var_map[row.getVar(i)] for i in range(row.size()))
-        expr += slack_var
+        if sense != GRB.EQUAL:
+            slack_var = new_model.addVar(lb=0 if sense == '<' else -GRB.INFINITY,
+                                        ub=GRB.INFINITY if sense == '<' else 0,
+                                        name=f"slack_{constr.ConstrName}")
+            expr += slack_var
         new_model.addConstr(expr == rhs, name=f"eq_{constr.ConstrName}")
     
-    # 设置目标函数
+    # Set the objective function.
     original_objective = model.getObjective()
     new_objective = sum(original_objective.getCoeff(i) * var_map[original_objective.getVar(i)] 
-                        for i in range(original_objective.size()))
-    new_model.setObjective(new_objective, model.ModelSense)  # 复制目标函数的方向
+                        for i in range(original_objective.size())) + original_objective.getConstant()
+    new_model.setObjective(new_objective, model.ModelSense)  # Preserve the objective sense.
 
-    # 更新模型
+    # Update the model.
     new_model.update()
     new_model.setParam('Method', 0)
     return new_model
 
 def recover_basis_np(predictions:np.ndarray, num_cons:int):
     solution = np.zeros_like(predictions.astype(int))
-    top_idx = np.argpartition(-predictions, num_cons)[:num_cons]
+    if not 0 <= num_cons <= predictions.size:
+        raise ValueError("num_cons must be between zero and the number of variables")
+    top_idx = np.argpartition(-predictions, num_cons - 1)[:num_cons] if num_cons else []
     solution[top_idx] = 1
     return solution
 
 def recover_basis(predictions, num_cons:int, logits=False):
-    if not logits:
-        return recover_basis_np(predictions, num_cons) if type(predictions) == np.ndarray else recover_basis_torch(predictions, num_cons)
+    if logits:
+        return recover_basis_logits(predictions, num_cons)
+    return recover_basis_np(predictions, num_cons) if isinstance(predictions, np.ndarray) else recover_basis_torch(predictions, num_cons)
 
 def recover_basis_logits(predictions:torch.Tensor, num_cons:int):
     if isinstance(predictions, np.ndarray):
         predictions = torch.tensor(predictions)
     assert predictions.shape[1] == 3
     top_idx = torch.topk(predictions[:, 1], num_cons).indices
-    solution = torch.zeros(predictions.shape[0], dtype=torch.float)
-    solution[top_idx] = 1.
+    solution = torch.zeros(predictions.shape[0], dtype=torch.float, device=predictions.device)
     solution[predictions[:, 0] < predictions[:, 2]] = 2.
+    solution[top_idx] = 1.
     return solution
 
 def recover_basis_torch(predictions:torch.Tensor, num_cons:int):
@@ -131,14 +135,10 @@ def recover_basis_torch(predictions:torch.Tensor, num_cons:int):
     return solution
 
 def recover_basis_gurobi(basis:np.ndarray, coef:np.ndarray, num_vars:int):
-    #TODO
-    pass
+    raise NotImplementedError('Use recover_basis followed by gp_utils.input_basis with an explicit Gurobi model')
 
 def calculate_Aty(predictions:torch.Tensor, std_matrix:torch.Tensor):
-    if std_matrix.is_sparse:
-        return torch.sparse.mm(std_matrix.t(), predictions.view(-1, 1)).view(-1)
-    else:
-        return std_matrix.t() @ predictions
+    return constraint_matmul(std_matrix.t(), predictions)
 
 
     
@@ -152,7 +152,7 @@ def dual_infer_primal_basis(predictions:torch.Tensor, std_matrix:torch.Tensor, c
     error_dual = (predictions)/ (torch.max(torch.abs(predictions) + 1e-6))
     error = torch.cat([error_cons, error_dual])
     basis = torch.zeros_like(error, dtype=torch.int)
-    topk_small = torch.topk(F.relu(error), std_matrix_shape[0], largest=False)
+    topk_small = torch.topk(torch.abs(error), std_matrix_shape[0], largest=False)
     basis[error > 0] = 2
     basis[error < 0] = 0
     basis[topk_small.indices] = 1
@@ -182,18 +182,16 @@ def recover_solution(basis:torch.Tensor, std_matrix:torch.Tensor, right_high_sid
         torch.Tensor: The recovered solution vector. 
         Note that the solution contains both the variable values and the slack values.
     """
-    basis = (basis == 1).bool()
-    var_sol = torch.where(coef >= 0, lb, ub)
-    #con_sol = torch.zeros(n_cons, device=device)
-    sol = var_sol#torch.cat([var_sol, con_sol])
-    sol[basis == 0] = lb[basis == 0]
-    sol[basis == 2] = ub[basis == 2]
+    basic = basis == 1
+    sol = torch.where(basis == 2, ub, lb).clone()
+    if not torch.isfinite(sol[~basic]).all():
+        raise ValueError('A nonbasic variable must have a finite bound for its selected basis status')
     #std_matrix = torch.cat([matrix, torch.eye(n_cons, device=device)], dim=1)
-    sub_matrix = std_matrix[:, basis]
+    sub_matrix = std_matrix[:, basic]
     sub_matrix_inv = torch.linalg.pinv(sub_matrix)
     
-    z = sub_matrix_inv @ (right_high_side - std_matrix[:, ~basis] @ sol[~basis])
-    sol[basis] = z
+    z = sub_matrix_inv @ (right_high_side - std_matrix[:, ~basic] @ sol[~basic])
+    sol[basic] = z
     
     # project back to the bound
     sol = torch.max(torch.min(sol, ub), lb)
@@ -208,11 +206,12 @@ def cat_sparse_identity(A):
     Return:
     [n_cons, n_var + n_cons] Sparse matrix
     '''
+    A = A.coalesce()
     n_cons, n_vars = A.shape
     device = A.device
 
-    identity_index = torch.stack([torch.arange(n_cons), torch.arange(n_cons)], dim=0)
-    identity_attr = torch.ones(n_cons, device=device)
+    identity_index = torch.stack([torch.arange(n_cons, device=device), torch.arange(n_cons, device=device)], dim=0)
+    identity_attr = torch.ones(n_cons, device=device, dtype=A.dtype)
 
     identity_index[1, :] += n_vars
 
@@ -228,17 +227,21 @@ def select_columns(A, selected_cols):
     Return:
     Sparse submatrix with only the specified columns, with the same number of rows
     '''
+    A = A.coalesce()
+    selected_cols = torch.as_tensor(selected_cols, device=A.device, dtype=torch.long).reshape(-1)
+    if ((selected_cols < 0) | (selected_cols >= A.shape[1])).any():
+        raise IndexError('Column index outside sparse matrix dimensions')
     row_indices, col_indices = A.indices()
     values = A.values()
-
-    mask = torch.isin(col_indices, torch.tensor(selected_cols, device=A.device))
-    new_row_indices = row_indices[mask]
-    new_col_indices = col_indices[mask]
-    new_values = values[mask]
-    
-    col_map = {old: new for new, old in enumerate(selected_cols)}
-    new_col_indices = torch.tensor([col_map[col.item()] for col in new_col_indices], device=A.device)
-
+    rows, columns, selected_values = [], [], []
+    for new_column, original_column in enumerate(selected_cols):
+        mask = col_indices == original_column
+        rows.append(row_indices[mask])
+        columns.append(torch.full_like(row_indices[mask], new_column))
+        selected_values.append(values[mask])
+    new_row_indices = torch.cat(rows) if rows else row_indices[:0]
+    new_col_indices = torch.cat(columns) if columns else col_indices[:0]
+    new_values = torch.cat(selected_values) if selected_values else values[:0]
     submatrix = torch.sparse_coo_tensor(
         torch.stack([new_row_indices, new_col_indices]),
         new_values,
@@ -255,12 +258,14 @@ def feasibility(x, A, b, lb, ub):
     lb: [n_var]
     ub: [n_var]
     Return:
-    The norm of the violation
+    The maximum of constraint and bound violation norms for Ax <= b.
+    Batched inputs return one violation value per sample.
     '''
-    violate_1 = torch
-    violate_2 = torch.norm(torch.max(x - lb, torch.zeros_like(lb)), p=2)
-    violate_3 = torch.norm(torch.max(ub - x, torch.zeros_like(ub)), p=2)
-    return torch.max(violate_1, torch.max(violate_2, violate_3))
+    Ax = constraint_matmul(A, x) if x.ndim == 1 else constraint_matmul(A, x.t()).t()
+    violate_1 = torch.linalg.vector_norm(torch.relu(Ax - b), dim=-1)
+    violate_2 = torch.linalg.vector_norm(torch.relu(lb - x), dim=-1)
+    violate_3 = torch.linalg.vector_norm(torch.relu(x - ub), dim=-1)
+    return torch.maximum(violate_1, torch.maximum(violate_2, violate_3))
 
 def objective(x, c):
     '''
@@ -269,24 +274,46 @@ def objective(x, c):
     Return:
     The objective value
     '''
-    return c @ x
+    return (c * x).sum(dim=-1)
 
 def create_graph_data(file, to_eq=True):
-    model = MIPmodel(file)
-    model = model.generBipar(to_eq=to_eq)
+    """Build the legacy LP-basis graph in Gurobi variable order.
+
+    The default adds slack variables so basis recovery operates on equalities.
+    Neural FMIP inference should use MIPmodel.generGraphCom/toHeteroData instead.
+    """
+    reader = MIPmodel(file)
+    model = transform_to_equalities(reader.model) if to_eq else reader.model
+    matrix = model.getA().tocoo()
+    variables = model.getVars()
     graph_data = GraphMILP()
-    graph_data['vars'].x = model['x_var']
-    graph_data['cons'].x = model['x_cons']
-    graph_data['vars', 'to', 'cons'].edge_index = model['edge_index']
-    graph_data['vars', 'to', 'cons'].edge_attr = model['edge_attr']
+    graph_data['vars'].x = torch.tensor([
+        [var.LB if var.LB > -GRB.INFINITY else 0.,
+         var.UB if var.UB < GRB.INFINITY else 0., var.Obj,
+         var.LB > -GRB.INFINITY, var.UB < GRB.INFINITY, 0.]
+        for var in variables], dtype=torch.float32).reshape(-1, 6)
+    graph_data['cons'].x = torch.tensor([con.RHS for con in model.getConstrs()], dtype=torch.float32).reshape(-1, 1)
+    graph_data['vars', 'to', 'cons'].edge_index = torch.tensor(np.stack([matrix.col, matrix.row]), dtype=torch.long)
+    graph_data['vars', 'to', 'cons'].edge_attr = torch.tensor(matrix.data, dtype=torch.float32).reshape(-1, 1)
+    graph_data.constraint_senses = [con.Sense for con in model.getConstrs()]
+    graph_data.model_sense = model.ModelSense
+    graph_data.objective_constant = model.ObjCon
     return graph_data
 
 def recover_approx_solution(graph_data, basis):
-    basis = torch.tensor(basis)
-    ori_problem = graph_data.restore_problem()
-    #std_matrix = torch.cat([ori_problem['A'].to_dense(), torch.eye(ori_problem['A'].shape[0])], dim=1)
-    std_matrix = ori_problem['A'].to_dense()
-    solution = recover_solution(basis, std_matrix, ori_problem['b'], ori_problem['c'], ori_problem['lb'], ori_problem['ub'])
+    if 'vars' not in graph_data.node_types:
+        raise ValueError('Basis recovery requires create_graph_data(..., to_eq=True), not an FMIP tripartite graph')
+    if any(sense != GRB.EQUAL for sense in graph_data.constraint_senses):
+        raise ValueError('Basis recovery requires equality form; use create_graph_data(..., to_eq=True)')
+    features = graph_data['vars'].x
+    edges = graph_data['vars', 'to', 'cons']
+    std_matrix = torch.sparse_coo_tensor(edges.edge_index[[1, 0]], edges.edge_attr.reshape(-1),
+                                         (graph_data['cons'].x.shape[0], features.shape[0]),
+                                         device=features.device).to_dense()
+    basis = torch.as_tensor(basis, device=features.device)
+    lower = torch.where(features[:, 3].bool(), features[:, 0], -torch.inf)
+    upper = torch.where(features[:, 4].bool(), features[:, 1], torch.inf)
+    solution = recover_solution(basis, std_matrix, graph_data['cons'].x.reshape(-1), features[:, 2], lower, upper)
     solution = solution.cpu().tolist()
     return solution
 
@@ -300,9 +327,9 @@ def mask_with_knowledge_(probs, vars_feat, item = - torch.inf):
 
     """
     # If lb = -inf then, set the probability to 0
-    probs[:, 0] = torch.where(vars_feat[:, 0] == 0, item, probs[:, 0])
+    probs[:, 0] = torch.where(~vars_feat[:, 3].bool(), item, probs[:, 0])
     # If ub = inf then, set the probability to 0
-    probs[:, 2] = torch.where(vars_feat[:, 1] == 0, item, probs[:, 2])
+    probs[:, 2] = torch.where(~vars_feat[:, 4].bool(), item, probs[:, 2])
     
     return None
 
@@ -326,8 +353,11 @@ def mask_with_knowledge(probs, vars_feat):
 def mask_and_divide_dominance(probs, var_feat):
     masked_probs = probs.clone()
     mask_with_knowledge_(masked_probs, var_feat, 0)
-    masked_probs = masked_probs / torch.sum(masked_probs, dim=1, keepdim=True)
-    return masked_probs
+    total = masked_probs.sum(dim=1, keepdim=True)
+    fallback = torch.zeros_like(masked_probs)
+    fallback[:, 1] = 1  # A free variable must be basic.
+    denominator = torch.where(total > 0, total, torch.ones_like(total))
+    return torch.where(total > 0, masked_probs / denominator, fallback)
 
 def normalize_problem(graph_data):
-    pass
+    raise NotImplementedError('Problem normalization requires an explicit reversible scaling convention')
